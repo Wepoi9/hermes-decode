@@ -1,0 +1,5 @@
+name: hermes-decode
+version: 0.1.0
+description: Desktop decode throughput aggregation from completed model API calls.
+provides_hooks:
+  - post_api_request

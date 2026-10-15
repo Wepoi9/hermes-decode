@@ -1,0 +1,724 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 57b84fac89..2c4a31fce7 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -2324,6 +2324,8 @@ _USAGE_STATE: dict[str, Any] = {
+     # Status-bar latency/velocity history (last 10 calls), shared by loop + codex_runtime.
+     "_api_latency_history": lambda: deque(maxlen=10),
+     "_api_output_history": lambda: deque(maxlen=10),
++    # Per-attempt decode seconds, initialized to None.
++    "_last_api_decode_seconds": None,
+ }
+ 
+ # Constructor params stored verbatim under the same name.
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index 01c26afe7a..c4a98c878a 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -2748,6 +2748,9 @@ class _StreamingCall(StreamingWaitMonitor):
+         self._request_cancelled = {"value": False}
+         self.first_delta_fired = {"done": False}
+         self.deltas_were_sent = {"yes": False}  # for the partial-delivery fallback
++        # Arrival of the call's first real-data delta (text/reasoning/tool start), stamped
++        # ahead of display routing; the decode window is measured from this stamp.
++        self._decode_first_delta_at = None
+         self.provider_tool_in_flight = {"yes": False}
+         # Last REAL chunk; the monitor detects SSE-ping-only connections with it.
+         self.last_chunk_time = {"t": time.time()}
+@@ -2812,6 +2815,9 @@ class _StreamingCall(StreamingWaitMonitor):
+         # Attempt-local like provider_tool_in_flight: a tool name from a stream that died
+         # before any text must not label a later attempt's partial stub or its retry decision.
+         self.result["partial_tool_names"] = []
++        # Every attempt's decode window opens with that attempt's OWN first real-data delta:
++        # a stamp inherited from a dropped attempt would measure the retry backoff as decode.
++        self._decode_first_delta_at = None
+         return attempt_id
+ 
+     def _cancel_current_stream_attempt(self, reason: str) -> None:
+@@ -2848,12 +2854,31 @@ class _StreamingCall(StreamingWaitMonitor):
+             stream_attempt_id, discarded_chunks, discarded_bytes,
+         )
+ 
++    def _mark_decode_start(self) -> None:
++        """Decode start: this attempt's first real-data delta reached the wire. Stamp before
++        anything a display callback might do; the measurement is decoupled from the notice."""
++        if self._decode_first_delta_at is None:
++            self._decode_first_delta_at = time.monotonic()
++
+     def _fire_first_delta(self):
+-        if not self.first_delta_fired["done"] and self.on_first_delta:
+-            self.first_delta_fired["done"] = True
+-            self._quiet(self.on_first_delta)
++        # Display notice only: replay/display paths fire the notice without opening a
++        # measurement window — the stamp belongs to _mark_decode_start at real-data delivery.
++        if not self.first_delta_fired["done"]:
++            if self.on_first_delta:
++                self.first_delta_fired["done"] = True
++                self._quiet(self.on_first_delta)
++
++    def _record_decode_seconds(self, *, counted: bool = True) -> None:
++        """Close this call's decode window: first real-data delta → the terminal response
++        for this model call was processed. Unmeasured calls (no token arrived, interrupt,
++        runaway cut, relay-replayed output) leave the attribute None so the usage path
++        appends a None decode entry — a fabricated speed is forbidden."""
++        first = self._decode_first_delta_at
++        if counted and first is not None:
++            self.agent._last_api_decode_seconds = time.monotonic() - first
+ 
+     def _emit_text(self, text: str) -> None:
++        self._mark_decode_start()
+         self._fire_first_delta()
+         self.agent._fire_stream_delta(text)
+         self.deltas_were_sent["yes"] = True
+@@ -2865,10 +2890,12 @@ class _StreamingCall(StreamingWaitMonitor):
+         return bool((getattr(self.agent, "_current_streamed_assistant_text", "") or "").strip())
+ 
+     def _emit_reasoning(self, text: str) -> None:
++        self._mark_decode_start()
+         self._fire_first_delta()
+         self.agent._fire_reasoning_delta(text)
+ 
+     def _emit_tool_started(self, name: str) -> None:
++        self._mark_decode_start()
+         self._fire_first_delta()
+         self.agent._fire_tool_gen_started(name)
+ 
+@@ -3225,6 +3252,10 @@ class _StreamingCall(StreamingWaitMonitor):
+         if runaway:
+             # Cut, not finished: the length path ends the turn on this mark instead of continuing.
+             response._runaway_repetition = True
++        # Decode window: only a clean terminal measures. A partial-stub response carries no
++        # finish reason, so it stays unmeasured — like the runaway cut and interrupt deliveries.
++        self._record_decode_seconds(counted=(not runaway and finish_reason is not None
++            and not self.agent._interrupt_requested))
+         return response
+ 
+     def _log_runaway_cut(self, channel: str) -> None:
+@@ -3494,6 +3525,10 @@ class _StreamingCall(StreamingWaitMonitor):
+             message._runaway_repetition = True  # same hand-off as the chat_completions wire
+             return message
+         if base_final_message is not None:
++            # Decode window: message_stop (the terminal frame) was confirmed and the final
++            # message processed. Relay-modified output stays unmeasured.
++            if not stream.output_modified:
++                self._record_decode_seconds()
+             self._check_anthropic_message(base_final_message, tool_drop=False)
+             if not stream.output_modified:
+                 return self._check_anthropic_message(base_final_message)
+diff --git a/agent/codex_runtime.py b/agent/codex_runtime.py
+index 8794219f8d..3d2e4e0707 100644
+--- a/agent/codex_runtime.py
++++ b/agent/codex_runtime.py
+@@ -862,6 +862,10 @@ class _CodexResponseAssembler:
+     terminal_service_tier = None  # the tier the backend SERVED (may differ from the one requested)
+     # terminal_status defaults to "completed", so settlement needs an explicitly observed response.completed frame.
+     saw_response_completed = False
++    # Decode window stamps: arrival of the first real-data delta (text/reason delta/tool
++    # call data) and the observed terminal frame. Either missing → unmeasured (None).
++    decode_first_delta_at = None
++    decode_terminal_at = None
+ 
+     def __init__(self, *, model, on_text_delta, on_reasoning_delta, on_commentary_message, on_first_delta):
+         self.model, self.on_text_delta, self.on_reasoning_delta = model, on_text_delta, on_reasoning_delta
+@@ -893,6 +897,11 @@ class _CodexResponseAssembler:
+             self.next_output_sequence += 1
+         if "function_call" in str(item_type):
+             self.has_tool_calls = True
++            # An announcement may carry no generated payload at all: backends announce the call
++            # with empty arguments and stream the real args in later argument events. Only args
++            # already on the wire start the window; the argument-event handler stamps those.
++            if self.decode_first_delta_at is None and str(_event_field(item, "arguments", "") or ""):
++                self.decode_first_delta_at = time.monotonic()
+             if item_id:
+                 announced_sequence, announced_index = self.announced_output_order[item_id]
+                 self.pending_function_calls[item_id] = {
+@@ -904,6 +913,9 @@ class _CodexResponseAssembler:
+         delta_text = _event_field(event, "delta", "")
+         if not delta_text:
+             return
++        # First token of this call reached the wire: stamp ahead of routing and callbacks.
++        if self.decode_first_delta_at is None:
++            self.decode_first_delta_at = time.monotonic()
+         # Harmony commentary/analysis text is mid-turn narration, never the final answer: route to the
+         # reasoning callback, keep only the item for replay.
+         if self.active_message_phase == "commentary":
+@@ -943,6 +955,12 @@ class _CodexResponseAssembler:
+ 
+     def _on_function_call(self, event: Any, event_type: str) -> None:
+         self.has_tool_calls = True
++        # Tool call arguments reached the wire: stamp before the pending lookup so the
++        # window starts at arrival, not at assembly (zero-arg payloads never stamp).
++        if self.decode_first_delta_at is None and (
++                _event_field(event, "delta", "") if "delta" in event_type
++                else _event_field(event, "arguments", "")):
++            self.decode_first_delta_at = time.monotonic()
+         key = self._pending_function_key(str(_event_field(event, "item_id", "")),
+                                          _event_field(event, "output_index"))
+         pending = self.pending_function_calls.get(key)
+@@ -958,7 +976,12 @@ class _CodexResponseAssembler:
+ 
+     def _on_reasoning_delta(self, event: Any, event_type: str) -> None:
+         reasoning_text = _event_field(event, "delta", "")
+-        if not reasoning_text or self.on_reasoning_delta is None:
++        if not reasoning_text:
++            return
++        # Reasoning tokens reached the wire: stamp ahead of the callback gate.
++        if self.decode_first_delta_at is None:
++            self.decode_first_delta_at = time.monotonic()
++        if self.on_reasoning_delta is None:
+             return
+         summary_index = _event_field(event, "summary_index")
+         if summary_index is not None:
+@@ -1017,6 +1040,10 @@ class _CodexResponseAssembler:
+ 
+     def _on_terminal(self, event: Any, event_type: str) -> bool:
+         self.saw_terminal = True
++        # Decode end: only a confirmed clean completion closes the window; failed/incomplete
++        # terminals leave the window unmeasured (the settled-window gate reads saw_response_completed).
++        if event_type == "response.completed":
++            self.decode_terminal_at = time.monotonic()
+         resp_obj = _event_field(event, "response")
+         if resp_obj is not None:
+             self.terminal_usage, self.terminal_response_id = _event_field(resp_obj, "usage"), _event_field(resp_obj, "id")
+@@ -1086,7 +1113,13 @@ class _CodexResponseAssembler:
+         return SimpleNamespace(
+             output=output, output_text="".join(self.text_deltas), usage=self.terminal_usage, status=self.terminal_status,
+             id=self.terminal_response_id, model=self.model, incomplete_details=self.terminal_incomplete_details,
+-            error=self.terminal_error, service_tier=self.terminal_service_tier)
++            error=self.terminal_error, service_tier=self.terminal_service_tier,
++            # Decode window: measured only when this call's own stream delivered both stamps
++            # under a clean terminal (first real-data delta → observed response.completed);
++            # failed/incomplete terminals and unopened windows stay None.
++            decode_seconds=(float(self.decode_terminal_at - self.decode_first_delta_at)
++                if self.saw_response_completed and self.decode_first_delta_at is not None
++                and self.decode_terminal_at is not None else None))
+ 
+ 
+ def _consume_codex_event_stream(
+@@ -1411,6 +1444,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
+                 raise
+             if not agent._interrupt_requested:
+                 _drain_for_finalizer(event_stream)
++                # Decode window: recorded for streams that completed normally; an
++                # unmeasured stream (no token, no terminal frame) records None, so the
++                # usage path never sees a stale value from an earlier call.
++                agent._last_api_decode_seconds = getattr(final, "decode_seconds", None)
+             if final.status in {"incomplete", "failed"}:
+                 logger.warning("Codex Responses stream terminal status=%s "
+                                "(incomplete_details=%s, error=%s, streamed_chars=%d). %s",
+diff --git a/agent/turn_api_request.py b/agent/turn_api_request.py
+index 1be4db0a62..26520859e4 100644
+--- a/agent/turn_api_request.py
++++ b/agent/turn_api_request.py
+@@ -105,6 +105,8 @@ def build_api_request(
+     agent._reset_stream_delivery_tracking()
+     # Per-attempt first-chunk timestamp so a stale value never leaks into post_api_request.
+     agent._last_api_first_chunk_at = None
++    # The decode window is per-attempt too: a retry never inherits pre-retry stamps.
++    agent._last_api_decode_seconds = None
+     # api_messages was built for the primary; a fallback (DeepSeek / Kimi / MiMo) may
+     # require reasoning_content — re-apply the echo-back pad (idempotent) and re-render
+     # the prompt-cache decoration for the current provider.
+diff --git a/agent/turn_response_intake.py b/agent/turn_response_intake.py
+index 7523a885c1..6652b01c89 100644
+--- a/agent/turn_response_intake.py
++++ b/agent/turn_response_intake.py
+@@ -9,6 +9,7 @@ from __future__ import annotations
+ from dataclasses import dataclass
+ import json
+ import logging
++import math
+ import re
+ from typing import Any, Dict, Optional
+ 
+@@ -55,6 +56,15 @@ def _coerce_content_text(raw: Any) -> str:
+     return str(raw)
+ 
+ 
++def _sanitize_decode_seconds(value: Any) -> Optional[float]:
++    """Keep only finite, positive decode durations."""
++    try:
++        seconds = float(value)
++    except (TypeError, ValueError, OverflowError):
++        return None
++    return seconds if math.isfinite(seconds) and seconds > 0 else None
++
++
+ def _fire_post_api_request_hook(
+     agent: Any, response: Any, assistant_message: Any, finish_reason: Any, *, api_messages: Any,
+     api_call_count: Any, api_duration: Any, api_start_time: Any, api_request_id: Any,
+@@ -83,6 +93,11 @@ def _fire_post_api_request_hook(
+                 # First stream chunk time (epoch s); None if not streamed / no chunk.
+                 # TTFB = first_chunk_at - started_at.
+                 first_chunk_at=getattr(agent, "_last_api_first_chunk_at", None),
++                # Decode window: first real data delta through terminal-frame processing.
++                # Non-streaming, unmeasured, interrupted, or replaced streams are None; retries reset state.
++                decode_seconds=_sanitize_decode_seconds(
++                    getattr(agent, "_last_api_decode_seconds", None)
++                ),
+                 finish_reason=finish_reason,
+                 message_count=len(api_messages),
+                 response_model=getattr(response, "model", None),
+diff --git a/tests/agent/test_codex_first_event_timing.py b/tests/agent/test_codex_first_event_timing.py
+index b08217841e..fb2ed36fae 100644
+--- a/tests/agent/test_codex_first_event_timing.py
++++ b/tests/agent/test_codex_first_event_timing.py
+@@ -1,3 +1,4 @@
++import pytest
+ from types import SimpleNamespace
+ 
+ import httpx
+@@ -20,6 +21,17 @@ def _agent() -> SimpleNamespace:
+     )
+ 
+ 
++def _mock_monotonic(monkeypatch, *stamps):
++    """Deterministic clock: each monotonic() call hands out the next scripted stamp.
++
++    Stamps land only at the decode-stamp sites (first real-data delta, clean
++    response.completed frame), so the scripted values measure exact windows —
++    no real sleeps, no OS clock-tick races.
++    """
++    stamps_iter = iter(stamps)
++    monkeypatch.setattr("agent.codex_runtime.time.monotonic", lambda: next(stamps_iter))
++
++
+ def _completed_events():
+     yield {
+         "type": "response.created",
+@@ -36,6 +48,9 @@ def test_codex_stream_records_first_lifecycle_event_before_text(monkeypatch):
+     agent = _agent()
+     ticks = iter((100.0, 200.0, 300.0))
+     monkeypatch.setattr("agent.codex_runtime.time.time", lambda: next(ticks))
++    # The second (successful) attempt stamps its own decode window: first output
++    # delta at 10.0, the completed frame at 100.5 — never the failed attempt's wait.
++    _mock_monotonic(monkeypatch, 10.0, 100.5)
+     attempts = 0
+ 
+     def create(**_):
+@@ -55,6 +70,224 @@ def test_codex_stream_records_first_lifecycle_event_before_text(monkeypatch):
+     assert result.status == "completed"
+     assert attempts == 2
+     assert agent._last_api_first_chunk_at == 100.0
++    # The decode window opened at the second attempt's first output delta and
++    # closed at its terminal event — measured seconds, never an empty-default zero.
++    decode_seconds = result.decode_seconds
++    assert isinstance(decode_seconds, float)
++    assert decode_seconds == 90.5
++    # The measured window is handed to the usage recording path on success only.
++    assert agent._last_api_decode_seconds == 90.5
++
++
++def test_codex_reasoning_delta_opens_the_decode_window(monkeypatch):
++    """Reasoning output is real model output: a reasoning delta starts the
++    window even when no visible text delta ever arrives."""
++    agent = _agent()
++    _mock_monotonic(monkeypatch, 10.0, 100.5)
++
++    def events():
++        yield {
++            "type": "response.created",
++            "response": {"id": "fixture", "status": "in_progress"},
++        }
++        yield {
++            "type": "response.output_item.added",
++            "item": {"type": "reasoning", "id": "r1"},
++        }
++        yield {
++            "type": "response.reasoning_text.delta",
++            "item_id": "r1",
++            "index": 0,
++            "offset": 0,
++            "delta": "thinking",
++        }
++        yield {
++            "type": "response.output_item.done",
++            "item": {
++                "type": "reasoning",
++                "id": "r1",
++                "summary": [{"type": "summary_text", "text": "thinking"}],
++            },
++        }
++        yield {
++            "type": "response.completed",
++            "response": {"id": "fixture", "status": "completed"},
++        }
++
++    client = SimpleNamespace(responses=SimpleNamespace(create=lambda **_: events()))
++
++    result = run_codex_stream(
++        agent, {"model": "timing-fixture", "input": "Think."}, client=client
++    )
++
++    decode_seconds = result.decode_seconds
++    assert isinstance(decode_seconds, float)
++    assert decode_seconds == 90.5
++    assert agent._last_api_decode_seconds == 90.5
++
++
++def test_codex_incomplete_terminal_leaves_the_window_unmeasured(monkeypatch):
++    """An incomplete terminal ends the call without a clean finish: tokens that
++    did arrive keep the window unmeasured — a partial call is not a speed."""
++    agent = _agent()
++    _mock_monotonic(monkeypatch, 10.0, 100.5)
++
++    def events():
++        yield {
++            "type": "response.created",
++            "response": {"id": "fixture", "status": "in_progress"},
++        }
++        yield {"type": "response.output_text.delta", "delta": "Half an answer"}
++        yield {
++            "type": "response.incomplete",
++            "response": {
++                "id": "fixture",
++                "status": "incomplete",
++                "incomplete_details": {"reason": "max_output_tokens"},
++            },
++        }
++
++    client = SimpleNamespace(responses=SimpleNamespace(create=lambda **_: events()))
++
++    result = run_codex_stream(
++        agent, {"model": "timing-fixture", "input": "Long."}, client=client
++    )
++
++    assert result.status == "incomplete"
++    assert result.decode_seconds is None
++    assert agent._last_api_decode_seconds is None
++
++
++def test_codex_failed_terminal_leaves_the_window_unmeasured(monkeypatch):
++    """A failed terminal is not a clean completion: even with tokens delivered,
++    the window stays unmeasured."""
++    agent = _agent()
++    _mock_monotonic(monkeypatch, 10.0, 100.5)
++
++    def events():
++        yield {
++            "type": "response.created",
++            "response": {"id": "fixture", "status": "in_progress"},
++        }
++        yield {"type": "response.output_text.delta", "delta": "Cut answer"}
++        yield {
++            "type": "response.failed",
++            "response": {
++                "id": "fixture",
++                "status": "failed",
++                "error": {"type": "server_error", "message": "boom"},
++            },
++        }
++
++    client = SimpleNamespace(responses=SimpleNamespace(create=lambda **_: events()))
++
++    result = run_codex_stream(
++        agent, {"model": "timing-fixture", "input": "Crash."}, client=client
++    )
++
++    assert result.status == "failed"
++    assert result.decode_seconds is None
++    assert agent._last_api_decode_seconds is None
++
++
++def test_codex_function_call_announcement_without_arguments_does_not_open_the_window():
++    """An announced function call may carry no generated payload yet: the bare
++    announcement must not open the decode window — only argument data that
++    reached the wire counts, so this stream stays unmeasured."""
++    agent = _agent()
++
++    def events():
++        yield {
++            "type": "response.created",
++            "response": {"id": "fixture", "status": "in_progress"},
++        }
++        yield {
++            "type": "response.output_item.added",
++            "item": {"type": "function_call", "id": "f1", "call_id": "c1", "name": "tool_x", "arguments": ""},
++        }
++        yield {
++            "type": "response.output_item.done",
++            "item": {"type": "function_call", "id": "f1", "call_id": "c1", "name": "tool_x", "arguments": ""},
++        }
++        yield {
++            "type": "response.completed",
++            "response": {"id": "fixture", "status": "completed"},
++        }
++
++    client = SimpleNamespace(responses=SimpleNamespace(create=lambda **_: events()))
++
++    result = run_codex_stream(
++        agent, {"model": "timing-fixture", "input": "Tool."}, client=client
++    )
++
++    assert result.status == "completed"
++    assert result.decode_seconds is None
++    assert agent._last_api_decode_seconds is None
++
++
++def test_codex_function_call_arguments_delta_opens_the_window(monkeypatch):
++    """Real tool-call arguments arriving on the wire open the window: the
++    announcement alone does not — the argument delta's arrival does."""
++    agent = _agent()
++    _mock_monotonic(monkeypatch, 10.0, 100.5)
++
++    def events():
++        yield {
++            "type": "response.created",
++            "response": {"id": "fixture", "status": "in_progress"},
++        }
++        yield {
++            "type": "response.output_item.added",
++            "item": {"type": "function_call", "id": "f1", "call_id": "c1", "name": "tool_x", "arguments": ""},
++        }
++        yield {
++            "type": "response.function_call_arguments.delta",
++            "item_id": "f1",
++            "index": 0,
++            "delta": '{"x": 1}',
++        }
++        yield {
++            "type": "response.output_item.done",
++            "item": {"type": "function_call", "id": "f1", "call_id": "c1", "name": "tool_x", "arguments": '{"x": 1}'},
++        }
++        yield {
++            "type": "response.completed",
++            "response": {"id": "fixture", "status": "completed"},
++        }
++
++    client = SimpleNamespace(responses=SimpleNamespace(create=lambda **_: events()))
++
++    result = run_codex_stream(
++        agent, {"model": "timing-fixture", "input": "Tool."}, client=client
++    )
++
++    assert result.decode_seconds == 90.5
++    assert agent._last_api_decode_seconds == 90.5
++
++
++def test_codex_stream_without_output_keeps_decode_window_unmeasured(monkeypatch):
++    """A stream that ends without any output delta measured nothing: the
++    window stays None rather than a fabricated near-instant speed."""
++    agent = _agent()
++
++    def events():
++        yield {
++            "type": "response.created",
++            "response": {"id": "fixture", "status": "in_progress"},
++        }
++        yield {
++            "type": "response.completed",
++            "response": {"id": "fixture", "status": "incomplete"},
++        }
++
++    client = SimpleNamespace(responses=SimpleNamespace(create=lambda **_: events()))
++
++    result = run_codex_stream(
++        agent, {"model": "timing-fixture", "input": "Quiet."}, client=client
++    )
++
++    assert result.decode_seconds is None
++    assert agent._last_api_decode_seconds is None
+ 
+ 
+ @pytest.mark.parametrize("retire_before_event", [False, True])
+diff --git a/tests/agent/test_first_chunk_at_hook.py b/tests/agent/test_first_chunk_at_hook.py
+index a7aa0dc108..ed14d9dd98 100644
+--- a/tests/agent/test_first_chunk_at_hook.py
++++ b/tests/agent/test_first_chunk_at_hook.py
+@@ -45,6 +45,25 @@ def _make_stream_chunk(content=None, finish_reason=None, model=None, usage=None)
+     return SimpleNamespace(choices=[choice], model=model, usage=usage)
+ 
+ 
++# Seconds the fake stream spends decoding between its first delta and its terminal frame.
++_DECODE_GAP_S = 0.05
++# A sleep can wake a few ms early on Windows, so the window lower bound stays loose.
++_MIN_MEASURED_S = 0.04
++
++
++def _make_stream_iterator(chunks, decode_gap_s=_DECODE_GAP_S):
++    """Yield fake chunks with a real decode window between the deltas.
++
++    Windows resolves adjacent clock reads to the same tick, so a back-to-back
++    in-memory stream measures a 0.0 s window and the contract records it as
++    unmeasured. The gap is the seconds this stream actually spends decoding.
++    """
++    for index, chunk in enumerate(chunks):
++        if index:
++            time.sleep(decode_gap_s)
++        yield chunk
++
++
+ @pytest.fixture()
+ def agent():
+     """Minimal AIAgent with mocked OpenAI client and tool loading."""
+@@ -109,7 +128,7 @@ class TestStreamHelperStashesFirstChunkAt:
+             _make_stream_chunk(content="!", finish_reason="stop", model="test-model"),
+         ]
+         mock_client = MagicMock()
+-        mock_client.chat.completions.create.return_value = iter(chunks)
++        mock_client.chat.completions.create.return_value = _make_stream_iterator(chunks)
+         mock_create.return_value = mock_client
+         agent.api_mode = "chat_completions"
+         agent._interrupt_requested = False
+@@ -123,6 +142,11 @@ class TestStreamHelperStashesFirstChunkAt:
+         stamped = agent._last_api_first_chunk_at
+         assert isinstance(stamped, float)
+         assert before <= stamped <= after
++        # Decode window: opened by the first real delta (the "Hello" chunk) and
++        # closed when the terminal frame was processed — never by wire-only data.
++        decode_seconds = agent._last_api_decode_seconds
++        assert isinstance(decode_seconds, float)
++        assert _MIN_MEASURED_S <= decode_seconds < 1.0
+ 
+     @patch("run_agent.AIAgent._create_request_openai_client")
+     @patch("run_agent.AIAgent._close_request_openai_client")
+@@ -146,6 +170,7 @@ class TestStreamHelperStashesFirstChunkAt:
+             agent._interruptible_streaming_api_call({})
+ 
+         assert agent._last_api_first_chunk_at is None
++        assert agent._last_api_decode_seconds is None  # a dead stream never measured a window
+ 
+     @patch("run_agent.AIAgent._create_request_openai_client")
+     @patch("run_agent.AIAgent._close_request_openai_client")
+@@ -175,6 +200,94 @@ class TestStreamHelperStashesFirstChunkAt:
+ 
+         assert response.id == PARTIAL_STREAM_STUB_ID
+         assert agent._last_api_first_chunk_at is None
++        assert agent._last_api_decode_seconds is None
++
++    @patch("run_agent.AIAgent._create_request_openai_client")
++    @patch("run_agent.AIAgent._close_request_openai_client")
++    def test_wire_only_chunks_do_not_start_the_decode_window(
++        self, _mock_close, mock_create, agent
++    ):
++        """A role-only wire chunk carries no token: the decode window must not
++        open on it — only real delta data counts as the first output token."""
++
++        def _role_only_then_dies():
++            yield _make_stream_chunk(model="test-model")  # delta carries no content
++            raise ConnectionError("dropped before any token arrived")
++
++        mock_client = MagicMock()
++        mock_client.chat.completions.create.return_value = _role_only_then_dies()
++        mock_create.return_value = mock_client
++        agent.api_mode = "chat_completions"
++        agent._interrupt_requested = False
++        agent._last_api_first_chunk_at = None
++        agent.stream_delta_callback = lambda _text: None
++
++        with pytest.raises(Exception):
++            agent._interruptible_streaming_api_call({})
++
++        assert agent._last_api_decode_seconds is None
++
++    @patch("run_agent.AIAgent._create_request_openai_client")
++    @patch("run_agent.AIAgent._close_request_openai_client")
++    def test_reasoning_delta_opens_the_decode_window(
++        self, _mock_close, mock_create, agent
++    ):
++        """Reasoning output is real model output: the window starts at the
++        first reasoning delta even when no visible text token ever arrives."""
++        think = _make_stream_chunk(model="test-model")
++        think.choices[0].delta.reasoning_content = "thinking first"
++        end = _make_stream_chunk(finish_reason="stop", model="test-model")
++
++        mock_client = MagicMock()
++        mock_client.chat.completions.create.return_value = _make_stream_iterator(
++            [think, end]
++        )
++        mock_create.return_value = mock_client
++        agent.api_mode = "chat_completions"
++        agent._interrupt_requested = False
++        agent._last_api_first_chunk_at = None
++
++        agent._interruptible_streaming_api_call({})
++
++        decode_seconds = agent._last_api_decode_seconds
++        assert isinstance(decode_seconds, float)
++        assert _MIN_MEASURED_S <= decode_seconds < 1.0
++
++    def test_attempt_start_clears_a_dropped_attempt_decode_stamp(self, agent):
++        """A decode stamp inherited from a dropped attempt would measure the retry
++        backoff as decode time — every attempt opens its window from its own stamp,
++        so starting an attempt always clears the previous attempt's stamp."""
++        from agent.chat_completion_helpers import _StreamingCall
++
++        call = _StreamingCall(agent, {}, None)
++        call._decode_first_delta_at = 1756000000.512  # stamp left by a dropped attempt
++        call._start_stream_attempt()
++
++        assert call._decode_first_delta_at is None
++
++    @patch("run_agent.AIAgent._create_request_openai_client")
++    @patch("run_agent.AIAgent._close_request_openai_client")
++    def test_stream_end_without_finish_reason_leaves_the_window_unmeasured(
++        self, _mock_close, mock_create, agent
++    ):
++        """A stream that ends cleanly with no finish reason delivered no clean
++        terminal — the window stays unmeasured, never a speed for a response
++        the provider never confirmed as finished."""
++        chunks = [
++            _make_stream_chunk(content="partial"),
++            _make_stream_chunk(content=" text"),  # no chunk ever carries a finish reason
++        ]
++        mock_client = MagicMock()
++        mock_client.chat.completions.create.return_value = _make_stream_iterator(chunks)
++        mock_create.return_value = mock_client
++        agent.api_mode = "chat_completions"
++        agent._interrupt_requested = False
++        agent._last_api_first_chunk_at = None
++
++        response = agent._interruptible_streaming_api_call({})
++
++        assert response.choices[0].message.content == "partial text"
++        assert agent._last_api_decode_seconds is None
+ 
+ 
+ # ── Conversation loop / hook payload level ───────────────────────────────
+@@ -195,7 +308,7 @@ class TestPostApiRequestFirstChunkAtPayload:
+             ),
+         ]
+         mock_client = MagicMock()
+-        mock_client.chat.completions.create.return_value = iter(chunks)
++        mock_client.chat.completions.create.return_value = _make_stream_iterator(chunks)
+         mock_create.return_value = mock_client
+         # A registered stream consumer forces the streaming path even though
+         # agent.client is a Mock.
+@@ -208,6 +321,9 @@ class TestPostApiRequestFirstChunkAtPayload:
+         assert "first_chunk_at" in post[0]
+         stamped = post[0]["first_chunk_at"]
+         assert isinstance(stamped, float)
++        # The payload window covers this call's own gap: measured seconds, never 0.0.
++        assert isinstance(post[0]["decode_seconds"], float)
++        assert _MIN_MEASURED_S <= post[0]["decode_seconds"] < 1.0
+         # TTFB must be derivable and sane: started_at <= first_chunk_at <= ended_at.
+         assert post[0]["started_at"] <= stamped <= post[0]["ended_at"]
+ 
+@@ -256,12 +372,14 @@ class TestPostApiRequestFirstChunkAtPayload:
+         assert len(post) == 1
+         assert "first_chunk_at" in post[0]
+         assert post[0]["first_chunk_at"] is None
++        assert post[0]["decode_seconds"] is None
+ 
+     def test_prior_attempt_timestamp_cannot_leak_into_next_call(self, agent):
+         """A stale timestamp left on the agent by an earlier API call must be
+         reset before the next attempt — a non-streamed follow-up call reports
+         None, never the previous call's value."""
+         agent._last_api_first_chunk_at = 1756000000.512  # stale prior attempt
++        agent._last_api_decode_seconds = 9.9  # stale prior decode window
+         agent.client.chat.completions.create.return_value = _mock_response(
+             content="Fresh answer", finish_reason="stop"
+         )
+@@ -271,4 +389,12 @@ class TestPostApiRequestFirstChunkAtPayload:
+         assert result["final_response"] == "Fresh answer"
+         assert len(post) == 1
+         assert post[0]["first_chunk_at"] is None
++        assert post[0]["decode_seconds"] is None
+         assert agent._last_api_first_chunk_at is None
++        assert agent._last_api_decode_seconds is None
++
++    @pytest.mark.parametrize("invalid", [0.0, -1.0, float("nan"), float("inf")])
++    def test_invalid_decode_seconds_emit_none(self, agent, invalid):
++        from agent.turn_response_intake import _sanitize_decode_seconds
++
++        assert _sanitize_decode_seconds(invalid) is None
