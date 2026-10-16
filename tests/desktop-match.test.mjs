@@ -93,6 +93,17 @@ assert.deepEqual(
   [otherSessionRow]
 )
 
+// An unmeasured call on a NEW endpoint — the endpoint moved within the same
+// process generation and model — still ends the session's freshest call with
+// no measurement: other-endpoint rows of the same session retire with it, or
+// the readout would replay a speed from the endpoint the user just left.
+// Another session's rows are never touched.
+const movedEndpointRow = { sessionId: 's', provider: 'p1', model: 'm', conn: 'c-a', tokPerSecond: 100 }
+const keptOtherSession = { sessionId: 's-keep', provider: 'p1', model: 'm', conn: 'c-a', tokPerSecond: 55 }
+const afterMove = applyIncomingSample([movedEndpointRow, keptOtherSession], { sessionId: 's', conn: 'c-y' }, null, 'm')
+assert.deepEqual(afterMove, [keptOtherSession])
+assert.equal(pickVisibleSample(afterMove, 's'), null)
+
 // The row list is bounded to the same eight windows as the python LRU.
 const many = Array.from({ length: 9 }, (_unused, index) => ({
   sessionId: `s-${index}`, provider: 'p', model: 'm', conn: null, tokPerSecond: 50 + index

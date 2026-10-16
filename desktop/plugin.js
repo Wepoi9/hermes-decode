@@ -46,10 +46,16 @@ export function applyIncomingSample(rows, key, sample, model) {
   // the SAME session's older-generation rows in the same shot; another
   // session's rows are never touched, and a known-generation row is kept.
   const staleGeneration = item => Boolean(key && key.gen) && item && item.sessionId === key.sessionId && item.gen !== key.gen
+  // An unmeasured call ends the session's freshest call with no measurement.
+  // The endpoint may have moved under the same generation and model: rows on
+  // OTHER endpoints of the same session retire with it, or the readout would
+  // replay their speed after the endpoint moved. The next measured call
+  // rebuilds a row; another session's rows are never touched.
+  const staleConn = item => !sample && item && item.sessionId === key.sessionId && item.conn !== key.conn
   // The row list stays bounded like the python window LRU: eight windows, no more.
   return [
     ...(sample ? [sample] : []),
-    ...rows.filter(item => !sameKey(item) && !staleModel(item) && !staleGeneration(item))
+    ...rows.filter(item => !sameKey(item) && !staleModel(item) && !staleGeneration(item) && !staleConn(item))
   ].slice(0, 8)
 }
 // CACHE-END
