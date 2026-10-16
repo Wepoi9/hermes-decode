@@ -30,44 +30,45 @@ const otherConn = { sessionId: 's-focused', provider: 'p2', model: 'm', conn: 'c
 const noConn = { sessionId: 's-focused', provider: 'p1', model: 'm', conn: null, tokPerSecond: 90 }
 const otherModel = { sessionId: 's-focused', provider: 'p1', model: 'other-model', conn: 'c-a', tokPerSecond: 400 }
 
-// The readout follows the FOCUSED session only: under a known focused model,
-// the newest measurement for that session and that model is the readout.
-assert.equal(pickVisibleSample([newer, older], 's-focused', 'm'), newer)
-assert.equal(pickVisibleSample([older], 's-focused', 'm'), older)
+// The readout follows the FOCUSED session only: the newest measurement for
+// that session is the readout (the matcher never narrows by model; see below).
+assert.equal(pickVisibleSample([newer, older], 's-focused'), newer)
+assert.equal(pickVisibleSample([older], 's-focused'), older)
 
 // Sessions share nothing: switching focus switches the reference, and a fresh
 // session (or a tab whose samples belong to another session) shows '—'.
-assert.equal(pickVisibleSample([otherSession], 's-focused', 'm'), null)
-assert.equal(pickVisibleSample([newer, older], 's-tab-b', 'm'), null)
-assert.equal(pickVisibleSample([otherSession, newer], 's-focused', 'm'), newer)
+assert.equal(pickVisibleSample([otherSession], 's-focused'), null)
+assert.equal(pickVisibleSample([newer, older], 's-tab-b'), null)
+assert.equal(pickVisibleSample([otherSession, newer], 's-focused'), newer)
 
 // The same session reached over two endpoints is ambiguous: show '—', never a
 // speed that belongs to a connection the user may not be using.
-assert.equal(pickVisibleSample([newer, otherConn], 's-focused', 'm'), null)
-assert.equal(pickVisibleSample([otherConn, newer, older], 's-focused', 'm'), null)
+assert.equal(pickVisibleSample([newer, otherConn], 's-focused'), null)
+assert.equal(pickVisibleSample([otherConn, newer, older], 's-focused'), null)
 
 // A sample the payload carries no endpoint identity for stays ambiguous when
 // it mixes with a known endpoint: mixed known/unknown never borrows the known
 // endpoint's speed. Alone, that consistent window is readable.
-assert.equal(pickVisibleSample([noConn, newer], 's-focused', 'm'), null)
-assert.equal(pickVisibleSample([noConn], 's-focused', 'm'), noConn)
+assert.equal(pickVisibleSample([noConn, newer], 's-focused'), null)
+assert.equal(pickVisibleSample([noConn], 's-focused'), noConn)
 
-// Another model never borrows the window when the focused session's own model
-// IS known (the python side also resets the session's decode history on a
-// model change; the matcher stays defensive). An UNKNOWN focused model is not
-// a license to borrow another model's measurement: the readout simply keeps
-// the newest measurement of the focused session itself.
-assert.equal(pickVisibleSample([otherModel], 's-focused', 'm'), null)
-assert.equal(pickVisibleSample([otherModel], 's-focused', null), otherModel)
-assert.equal(pickVisibleSample([otherModel], 's-focused', ''), otherModel)
-assert.equal(pickVisibleSample([newer, otherModel], 's-focused', null), newer)
+// The matcher never narrows by model: the host cannot resolve the focused
+// session's own model, and borrowing the main model's slug for that would
+// point a tab's readout at a model it is not running. So the newest sample of
+// the focused session wins regardless of which model recorded it — per-model
+// freshness lives in the windows (python resets the decode history on a model
+// change and a new-model sample retires that session's stale-model rows in the
+// cache), which is what keeps a stale-model speed off the readout.
+assert.equal(pickVisibleSample([otherModel], 's-focused'), otherModel)
+assert.equal(pickVisibleSample([newer, otherModel], 's-focused'), newer)
+assert.equal(pickVisibleSample([otherModel, newer], 's-focused'), otherModel)
 
 // No focused session (null/empty), malformed input, or junk entries never crash the readout.
-assert.equal(pickVisibleSample([newer], null, 'm'), null)
-assert.equal(pickVisibleSample([newer], '', 'm'), null)
-assert.equal(pickVisibleSample([], 's-focused', 'm'), null)
-assert.equal(pickVisibleSample(null, 's-focused', 'm'), null)
-assert.equal(pickVisibleSample([null, newer, older], 's-focused', 'm'), newer)
+assert.equal(pickVisibleSample([newer], null), null)
+assert.equal(pickVisibleSample([newer], ''), null)
+assert.equal(pickVisibleSample([], 's-focused'), null)
+assert.equal(pickVisibleSample(null, 's-focused'), null)
+assert.equal(pickVisibleSample([null, newer, older], 's-focused'), newer)
 
 // The desktop cache keeps one row per (session, endpoint) window, replacing the
 // stale aggregate for that window only.
@@ -129,7 +130,7 @@ assert.deepEqual(
 )
 // After the restart retires the pre-restart row, the window holds one endpoint
 // and reads its speed (it is never forced to '—' by a stale endpoint it no longer has).
-assert.equal(pickVisibleSample([postRestartSample], 's', 'm'), postRestartSample)
+assert.equal(pickVisibleSample([postRestartSample], 's'), postRestartSample)
 
 // The bar item registers as a toggleable DATA contribution: `data` IS the
 // bar's own StatusbarItem (its id, the menu name, and the render live inside

@@ -9,11 +9,10 @@ const latestSamples = atom([])
 // keyed the same way: another session never borrows a measurement, and one
 // session never mixes two connection endpoints into one aggregate. The readout
 // follows the FOCUSED stored session — switching sessions switches the
-// reference, a fresh session shows '—' until its first completed call. The host
-// publishes only the MAIN model slug; the focused session's own model is not a
-// door the SDK hands a plugin, so it stays unresolved and the readout never
-// borrows the main model's slug to filter another tab's samples. Model-change
-// freshness comes from the windows themselves: a model change clears that
+// reference, a fresh session shows '—' until its first completed call. The SDK
+// does not hand a plugin the focused session's own model, so the readout never
+// narrows by model: the newest measurement of the focused session wins, and
+// per-model freshness stays in the windows — a model change clears that
 // session's decode history on the python side, and a sample under the new
 // model retires that session's stale model rows from the desktop cache in the
 // same update. conn is an opaque endpoint identity (never a URL): samples whose
@@ -22,14 +21,9 @@ const latestSamples = atom([])
 // generation id and a sample under the newer generation retires the same
 // session's pre-restart rows before the readout looks at them.
 // MATCHER-BEGIN (tests/desktop-match.test.mjs extracts this block verbatim)
-export function pickVisibleSample(samples, sessionId, model) {
+export function pickVisibleSample(samples, sessionId) {
   if (!Array.isArray(samples) || typeof sessionId !== 'string' || !sessionId) return null
-  // `model` is the focused session's OWN model when the host can resolve it,
-  // and null when it cannot: an unresolved model never borrows another
-  // session's — or the main model's — measurement to filter with.
-  const knownModel = typeof model === 'string' && model ? model : null
-  const matches = samples.filter(item => item && item.sessionId === sessionId &&
-    (knownModel === null || (typeof item.model === 'string' && item.model === knownModel)))
+  const matches = samples.filter(item => item && item.sessionId === sessionId)
   if (!matches.length) return null
   // One endpoint for these samples: the newest measurement is the readout.
   // Mixed endpoints (or a sample the payload carries no endpoint identity for)
@@ -59,13 +53,13 @@ export function applyIncomingSample(rows, key, sample, model) {
   ].slice(0, 8)
 }
 // CACHE-END
-// The SDK exposes the main model slug only; the focused session's own model is
-// unresolved for a plugin, so the matcher runs without a model filter rather
-// than borrowing the main model for a focused tab. (null = unresolved.)
-const focusedSessionModel = null
+// The SDK does not expose the focused session's own model, and borrowing the
+// main model's slug for it would point a tab's readout at a model it is not
+// running, so the matcher narrows by session only: the newest sample of the
+// focused session wins regardless of which model recorded it.
 const visibleSample = computed(
   [latestSamples, host.state.focusedStoredSessionId],
-  (samples, sessionId) => pickVisibleSample(samples, sessionId, focusedSessionModel)
+  (samples, sessionId) => pickVisibleSample(samples, sessionId)
 )
 
 function DecodeSpeed() {
