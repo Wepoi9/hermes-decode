@@ -11,7 +11,7 @@
     Copyright (c) 2025 Nous Research
 
 - 上流リポジトリ: https://github.com/NousResearch/hermes-agent（MIT ライセンス）
-- 基準コミット（`decode-hook.patch`）: `cca83848ec79a4a6a2ecc10285725559bf72c97c`（上流 main の固定コミット）
+- 基準コミット（`decode-hook.patch`）: `9c002cb941de1e1708294d0cd58e060b6a417b5e`（上流 main の固定コミット）
 - 基準コミット（`decode-hook-v0.22.2.patch`）: `d923a5eb487a17c0a68801bba9ef0f56c81040a8`（公表済み v0.22.2 タグコミット）
 - 上流 PR: NousResearch/hermes-agent#139204（マージ待ち）
 

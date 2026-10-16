@@ -1,8 +1,8 @@
 diff --git a/agent/agent_init.py b/agent/agent_init.py
-index 57b84fac89..2c4a31fce7 100644
+index 58ed7e0e30..c0755cf038 100644
 --- a/agent/agent_init.py
 +++ b/agent/agent_init.py
-@@ -2324,6 +2324,8 @@ _USAGE_STATE: dict[str, Any] = {
+@@ -2274,6 +2274,8 @@ _USAGE_STATE: dict[str, Any] = {
      # Status-bar latency/velocity history (last 10 calls), shared by loop + codex_runtime.
      "_api_latency_history": lambda: deque(maxlen=10),
      "_api_output_history": lambda: deque(maxlen=10),
@@ -10,7 +10,7 @@ index 57b84fac89..2c4a31fce7 100644
 +    "_last_api_decode_seconds": None,
  }
  
- # Constructor params stored verbatim under the same name.
+ 
 diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
 index 01c26afe7a..c4a98c878a 100644
 --- a/agent/chat_completion_helpers.py
@@ -260,7 +260,7 @@ index 7523a885c1..6652b01c89 100644
                  message_count=len(api_messages),
                  response_model=getattr(response, "model", None),
 diff --git a/tests/agent/test_codex_first_event_timing.py b/tests/agent/test_codex_first_event_timing.py
-index b08217841e..fb2ed36fae 100644
+index b08217841e..ca5fb4eeaa 100644
 --- a/tests/agent/test_codex_first_event_timing.py
 +++ b/tests/agent/test_codex_first_event_timing.py
 @@ -1,3 +1,4 @@
@@ -268,7 +268,7 @@ index b08217841e..fb2ed36fae 100644
  from types import SimpleNamespace
  
  import httpx
-@@ -20,6 +21,17 @@ def _agent() -> SimpleNamespace:
+@@ -20,6 +21,25 @@ def _agent() -> SimpleNamespace:
      )
  
  
@@ -280,13 +280,21 @@ index b08217841e..fb2ed36fae 100644
 +    no real sleeps, no OS clock-tick races.
 +    """
 +    stamps_iter = iter(stamps)
-+    monkeypatch.setattr("agent.codex_runtime.time.monotonic", lambda: next(stamps_iter))
++    # The test replaced the process-wide time.monotonic, so ambient users of the
++    # clock keep calling it after the test body: Windows proactor shutdown calls
++    # time.monotonic() while the conftest closes the loop during fixture
++    # teardown. An exhausted queue must not raise there — the clock repeats its
++    # last stamp instead of raising StopIteration.
++    monkeypatch.setattr(
++        "agent.codex_runtime.time.monotonic",
++        lambda: next(stamps_iter, stamps[-1] if stamps else 0.0),
++    )
 +
 +
  def _completed_events():
      yield {
          "type": "response.created",
-@@ -36,6 +48,9 @@ def test_codex_stream_records_first_lifecycle_event_before_text(monkeypatch):
+@@ -36,6 +56,9 @@ def test_codex_stream_records_first_lifecycle_event_before_text(monkeypatch):
      agent = _agent()
      ticks = iter((100.0, 200.0, 300.0))
      monkeypatch.setattr("agent.codex_runtime.time.time", lambda: next(ticks))
@@ -296,7 +304,7 @@ index b08217841e..fb2ed36fae 100644
      attempts = 0
  
      def create(**_):
-@@ -55,6 +70,224 @@ def test_codex_stream_records_first_lifecycle_event_before_text(monkeypatch):
+@@ -55,6 +78,224 @@ def test_codex_stream_records_first_lifecycle_event_before_text(monkeypatch):
      assert result.status == "completed"
      assert attempts == 2
      assert agent._last_api_first_chunk_at == 100.0

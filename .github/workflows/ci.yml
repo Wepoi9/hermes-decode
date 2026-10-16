@@ -48,9 +48,11 @@ jobs:
         with:
           python-version: '3.14'
       - name: Clone upstream Hermes and check out the base commit
+        # The base commit is the fork PR branch's parent commit; when the PR
+        # branch rebases, keep this pin and the regenerated patch in step.
         run: |
           git clone --filter=blob:none --no-checkout https://github.com/NousResearch/hermes-agent.git hermes
-          git -C hermes switch --detach cca83848ec79a4a6a2ecc10285725559bf72c97c
+          git -C hermes switch --detach 9c002cb941de1e1708294d0cd58e060b6a417b5e
       - name: Apply --check and apply the decode hook patch
         run: |
           git -C hermes apply --check "$GITHUB_WORKSPACE/patches/decode-hook.patch"
