@@ -522,10 +522,10 @@ index b08217841e..fb2ed36fae 100644
  
  @pytest.mark.parametrize("retire_before_event", [False, True])
 diff --git a/tests/agent/test_first_chunk_at_hook.py b/tests/agent/test_first_chunk_at_hook.py
-index a7aa0dc108..ed14d9dd98 100644
+index a7aa0dc108..e8e0855d3d 100644
 --- a/tests/agent/test_first_chunk_at_hook.py
 +++ b/tests/agent/test_first_chunk_at_hook.py
-@@ -45,6 +45,25 @@ def _make_stream_chunk(content=None, finish_reason=None, model=None, usage=None)
+@@ -45,6 +45,43 @@ def _make_stream_chunk(content=None, finish_reason=None, model=None, usage=None)
      return SimpleNamespace(choices=[choice], model=model, usage=usage)
  
  
@@ -548,10 +548,28 @@ index a7aa0dc108..ed14d9dd98 100644
 +        yield chunk
 +
 +
++def _anthropic_event(event_type, **fields):
++    return SimpleNamespace(type=event_type, **fields)
++
++
++def _anthropic_text_delta(text):
++    return _anthropic_event(
++        "content_block_delta", delta=SimpleNamespace(type="text_delta", text=text)
++    )
++
++
++def _make_anthropic_event_iterator(events, decode_gap_s=_DECODE_GAP_S):
++    """Anthropic Messages stream events with the same real decode gap as above."""
++    for index, event in enumerate(events):
++        if index:
++            time.sleep(decode_gap_s)
++        yield event
++
++
  @pytest.fixture()
  def agent():
      """Minimal AIAgent with mocked OpenAI client and tool loading."""
-@@ -109,7 +128,7 @@ class TestStreamHelperStashesFirstChunkAt:
+@@ -109,7 +146,7 @@ class TestStreamHelperStashesFirstChunkAt:
              _make_stream_chunk(content="!", finish_reason="stop", model="test-model"),
          ]
          mock_client = MagicMock()
@@ -560,7 +578,7 @@ index a7aa0dc108..ed14d9dd98 100644
          mock_create.return_value = mock_client
          agent.api_mode = "chat_completions"
          agent._interrupt_requested = False
-@@ -123,6 +142,11 @@ class TestStreamHelperStashesFirstChunkAt:
+@@ -123,6 +160,11 @@ class TestStreamHelperStashesFirstChunkAt:
          stamped = agent._last_api_first_chunk_at
          assert isinstance(stamped, float)
          assert before <= stamped <= after
@@ -572,7 +590,7 @@ index a7aa0dc108..ed14d9dd98 100644
  
      @patch("run_agent.AIAgent._create_request_openai_client")
      @patch("run_agent.AIAgent._close_request_openai_client")
-@@ -146,6 +170,7 @@ class TestStreamHelperStashesFirstChunkAt:
+@@ -146,6 +188,7 @@ class TestStreamHelperStashesFirstChunkAt:
              agent._interruptible_streaming_api_call({})
  
          assert agent._last_api_first_chunk_at is None
@@ -580,7 +598,7 @@ index a7aa0dc108..ed14d9dd98 100644
  
      @patch("run_agent.AIAgent._create_request_openai_client")
      @patch("run_agent.AIAgent._close_request_openai_client")
-@@ -175,6 +200,94 @@ class TestStreamHelperStashesFirstChunkAt:
+@@ -175,6 +218,171 @@ class TestStreamHelperStashesFirstChunkAt:
  
          assert response.id == PARTIAL_STREAM_STUB_ID
          assert agent._last_api_first_chunk_at is None
@@ -672,10 +690,87 @@ index a7aa0dc108..ed14d9dd98 100644
 +
 +        assert response.choices[0].message.content == "partial text"
 +        assert agent._last_api_decode_seconds is None
++
++
++# ── anthropic_messages wire (native Messages stream) ─────────────────────
++
++
++def _anthropic_stream_cm(final_message, events):
++    stream = MagicMock()
++    stream.__iter__ = MagicMock(return_value=_make_anthropic_event_iterator(events))
++    stream.get_final_message = MagicMock(return_value=final_message)
++    cm = MagicMock()
++    cm.__enter__ = MagicMock(return_value=stream)
++    cm.__exit__ = MagicMock(return_value=False)
++    return cm
++
++
++class TestAnthropicStreamDecodeWindow:
++    """The decode window on the native Anthropic Messages stream is closed only
++    by a confirmed message_stop (the terminal frame of that wire)."""
++
++    @staticmethod
++    def _wire_agent(agent):
++        agent.api_mode = "anthropic_messages"
++        agent._interrupt_requested = False
++        agent._anthropic_client = MagicMock()
++        agent._create_request_anthropic_client = lambda *a, **k: agent._anthropic_client
++        return agent
++
++    def test_message_stop_terminaton_closes_the_decode_window(self, agent):
++        """A normal termination (message_stop after the last delta, final message
++        processed) measures this call's own decode window."""
++        agent = self._wire_agent(agent)
++        completed = SimpleNamespace(
++            content=[SimpleNamespace(type="text", text="Hello world")],
++            stop_reason="end_turn",
++        )
++        agent._anthropic_client.messages.stream.return_value = _anthropic_stream_cm(
++            completed,
++            [
++                _anthropic_event("message_start"),
++                _anthropic_text_delta("Hello"),
++                _anthropic_text_delta(" world"),
++                _anthropic_event("message_stop"),
++            ],
++        )
++
++        response = agent._interruptible_streaming_api_call({"model": "claude-test"})
++
++        assert response is completed
++        decode_seconds = agent._last_api_decode_seconds
++        assert isinstance(decode_seconds, float)
++        assert _MIN_MEASURED_S <= decode_seconds < 1.0
++
++    def test_eof_before_message_stop_leaves_the_window_unmeasured(self, agent):
++        """A stream that ends before message_stop delivered deltas but never a
++        confirmed terminal: the opened window stays unmeasured — the delivered
++        partial is the stub fallback, never a measured speed."""
++        agent = self._wire_agent(agent)
++        delivered = []
++        agent.stream_delta_callback = delivered.append
++        partial = SimpleNamespace(
++            content=[SimpleNamespace(type="text", text="HALF-ANSWER")],
++            stop_reason="end_turn",
++        )
++        agent._anthropic_client.messages.stream.return_value = _anthropic_stream_cm(
++            partial,
++            [_anthropic_event("message_start"), _anthropic_text_delta("HALF-ANSWER")],
++        )
++
++        response = agent._interruptible_streaming_api_call({"model": "claude-test"})
++
++        from hermes_constants import PARTIAL_STREAM_STUB_ID
++
++        assert response.id == PARTIAL_STREAM_STUB_ID
++        # The first text delta opened the window (it was delivered) and the
++        # stream still never closed it: no speed for an unconfirmed response.
++        assert delivered == ["HALF-ANSWER"]
++        assert agent._last_api_decode_seconds is None
  
  
  # ── Conversation loop / hook payload level ───────────────────────────────
-@@ -195,7 +308,7 @@ class TestPostApiRequestFirstChunkAtPayload:
+@@ -195,7 +403,7 @@ class TestPostApiRequestFirstChunkAtPayload:
              ),
          ]
          mock_client = MagicMock()
@@ -684,7 +779,7 @@ index a7aa0dc108..ed14d9dd98 100644
          mock_create.return_value = mock_client
          # A registered stream consumer forces the streaming path even though
          # agent.client is a Mock.
-@@ -208,6 +321,9 @@ class TestPostApiRequestFirstChunkAtPayload:
+@@ -208,6 +416,9 @@ class TestPostApiRequestFirstChunkAtPayload:
          assert "first_chunk_at" in post[0]
          stamped = post[0]["first_chunk_at"]
          assert isinstance(stamped, float)
@@ -694,7 +789,7 @@ index a7aa0dc108..ed14d9dd98 100644
          # TTFB must be derivable and sane: started_at <= first_chunk_at <= ended_at.
          assert post[0]["started_at"] <= stamped <= post[0]["ended_at"]
  
-@@ -256,12 +372,14 @@ class TestPostApiRequestFirstChunkAtPayload:
+@@ -256,12 +467,14 @@ class TestPostApiRequestFirstChunkAtPayload:
          assert len(post) == 1
          assert "first_chunk_at" in post[0]
          assert post[0]["first_chunk_at"] is None
@@ -709,7 +804,7 @@ index a7aa0dc108..ed14d9dd98 100644
          agent.client.chat.completions.create.return_value = _mock_response(
              content="Fresh answer", finish_reason="stop"
          )
-@@ -271,4 +389,12 @@ class TestPostApiRequestFirstChunkAtPayload:
+@@ -271,4 +484,12 @@ class TestPostApiRequestFirstChunkAtPayload:
          assert result["final_response"] == "Fresh answer"
          assert len(post) == 1
          assert post[0]["first_chunk_at"] is None

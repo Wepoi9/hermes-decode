@@ -2,8 +2,10 @@
 
 from collections import OrderedDict, deque
 import hashlib
+import hmac
 import math
 from numbers import Real
+import os
 import threading
 
 PLUGIN_ID = "hermes-decode"
@@ -11,6 +13,11 @@ WINDOW_SIZE = 10
 MAX_DECODE_WINDOWS = 8
 SCHEMA_VERSION = 1
 CONNAUTH_ID_LENGTH = 12
+# Random once per process (and once per plugin reload, which re-imports this
+# module): the connection identity is keyed by it, so no external observer can
+# match a candidate URL against a published digest — the identity lives only in
+# this process's memory and dies with it.
+_CONNECTION_KEY = os.urandom(32)
 
 
 def _positive_finite(value):
@@ -33,17 +40,23 @@ def _output_tokens(usage):
 def _conn_id(base_url):
     """Derive an opaque connection identity from the endpoint the hook carries.
 
-    The Desktop never sees the URL itself: only this short digest, so samples
-    stay separable per real connection endpoint without leaking the endpoint.
-    Root URLs are normalized (trim, drop the trailing slash, casefold) before
-    hashing; a missing or malformed URL carries no identity and stays None.
+    The Desktop never sees the URL itself: only this short keyed digest, so
+    samples stay separable per real connection endpoint without leaking the
+    endpoint. Root URLs are normalized (trim, drop the trailing slash,
+    casefold) before the keyed hash; a missing or malformed URL carries no
+    identity and stays None. A deterministic digest would let anyone match
+    candidate URLs against a published identity, so the digest is an HMAC
+    under the process-random key: same URL means same identity inside one
+    process, and every process (reload, restart) derives its own value.
     """
     if not isinstance(base_url, str):
         return None
     normalized = base_url.strip().rstrip("/")
     if not normalized:
         return None
-    return hashlib.sha1(normalized.casefold().encode("utf-8")).hexdigest()[:CONNAUTH_ID_LENGTH]
+    return hmac.new(
+        _CONNECTION_KEY, normalized.casefold().encode("utf-8"), hashlib.sha1
+    ).hexdigest()[:CONNAUTH_ID_LENGTH]
 
 
 class DecodeAggregator:

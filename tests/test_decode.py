@@ -96,6 +96,8 @@ def test_another_model_never_borrows_the_window(monkeypatch):
 
 def test_conn_identity_is_derived_and_opaque():
     derived = plugin._conn_id("https://private.invalid")
+    # Same endpoint, one identity inside one process — window keys stay stable.
+    assert derived == plugin._conn_id("https://private.invalid")
     assert derived == plugin._conn_id("https://private.invalid/")
     assert derived == plugin._conn_id("https://private.invalid ")
     assert derived != plugin._conn_id("https://other.invalid")
@@ -105,6 +107,18 @@ def test_conn_identity_is_derived_and_opaque():
     assert plugin._conn_id(None) is None
     assert plugin._conn_id("") is None
     assert plugin._conn_id("   / ") is None
+
+
+def test_conn_identity_is_not_globally_deterministic():
+    # A salt-less deterministic digest would let anyone match candidate URLs
+    # against a published identity; the identity is keyed per process instead,
+    # so a fresh import (a plugin reload, a new process) derives its own value
+    # while staying stable for that process.
+    fresh_spec = importlib.util.spec_from_file_location("hermes_decode_conn_fresh", MODULE_PATH)
+    fresh = importlib.util.module_from_spec(fresh_spec)
+    fresh_spec.loader.exec_module(fresh)
+    assert fresh._conn_id("https://private.invalid") != plugin._conn_id("https://private.invalid")
+    assert fresh._conn_id("https://private.invalid") == fresh._conn_id("https://private.invalid ")
 
 
 def test_invalid_metrics_and_usage_are_unmeasured():

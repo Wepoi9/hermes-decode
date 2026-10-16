@@ -33,29 +33,66 @@ jobs:
         run: |
           cp desktop/plugin.js /tmp/hermes-decode.mjs
           node --check /tmp/hermes-decode.mjs
-      - name: Test the status-bar matcher (dependency-free)
+      - name: Test the status-bar matcher and cache (dependency-free)
         run: node tests/desktop-match.test.mjs
 
   core-patch-applies:
-    name: Core patch applies to its base commit
+    name: Core patch applies to its base commit and its tests run
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Clone upstream Hermes and check out the base commit
         run: |
           git clone --filter=blob:none --no-checkout https://github.com/NousResearch/hermes-agent.git hermes
           git -C hermes switch --detach cca83848ec79a4a6a2ecc10285725559bf72c97c
-      - name: Apply --check the decode hook patch
-        run: git -C hermes apply --check "$GITHUB_WORKSPACE/patches/decode-hook.patch"
+      - name: Apply --check and apply the decode hook patch
+        run: |
+          git -C hermes apply --check "$GITHUB_WORKSPACE/patches/decode-hook.patch"
+          git -C hermes apply "$GITHUB_WORKSPACE/patches/decode-hook.patch"
+      - name: Run the decode measurement tests on the applied tree
+        # The patch carries both measurement files; on the main basis the chat
+        # suite (including the Anthropic decode-window cases) collects cleanly,
+        # so the applied tree must actually pass them, not just apply.
+        run: |
+          pip install -e ./hermes --quiet
+          pip install --quiet pytest anthropic
+          cd hermes
+          python -m pytest tests/agent/test_first_chunk_at_hook.py tests/agent/test_codex_first_event_timing.py -q
+        env:
+          OPENAI_API_KEY: ""
+          OPENROUTER_API_KEY: ""
 
   core-patch-applies-v0222:
-    name: Release patch applies to the v0.22.2 tag
+    name: Release patch applies to the v0.22.2 tag and its timing test runs
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Clone upstream Hermes and check out the v0.22.2 tag commit
         run: |
           git clone --filter=blob:none --no-checkout https://github.com/NousResearch/hermes-agent.git hermes
           git -C hermes switch --detach d923a5eb487a17c0a68801bba9ef0f56c81040a8
-      - name: Apply --check the v0.22.2 decode hook patch
-        run: git -C hermes apply --check "$GITHUB_WORKSPACE/patches/decode-hook-v0.22.2.patch"
+      - name: Apply --check and apply the v0.22.2 decode hook patch
+        run: |
+          git -C hermes apply --check "$GITHUB_WORKSPACE/patches/decode-hook-v0.22.2.patch"
+          git -C hermes apply "$GITHUB_WORKSPACE/patches/decode-hook-v0.22.2.patch"
+      - name: Run the codex timing test on the applied release tree
+        # On the v0.22.2 basis only the codex timing file runs: the release
+        # branch's chat-side module chain hits the known release-side import
+        # bug (tui_gateway/methods_onboarding.py references Path without a
+        # pathlib import), which breaks collection of the chat file on ANY
+        # platform. The Anthropic cases shipped in the same patch stay
+        # apply-verified there, not test-run — an honest partial.
+        run: |
+          pip install -e ./hermes --quiet
+          pip install --quiet pytest anthropic
+          cd hermes
+          python -m pytest tests/agent/test_codex_first_event_timing.py -q
+        env:
+          OPENAI_API_KEY: ""
+          OPENROUTER_API_KEY: ""
