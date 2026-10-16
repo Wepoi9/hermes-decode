@@ -131,4 +131,30 @@ assert.deepEqual(
 // and reads its speed (it is never forced to '—' by a stale endpoint it no longer has).
 assert.equal(pickVisibleSample([postRestartSample], 's', 'm'), postRestartSample)
 
+// The bar item registers as a toggleable DATA contribution: `data` IS the
+// bar's own StatusbarItem (its id, the menu name, and the render live inside
+// it), so the bar's right-click "Show in status bar" menu lists it and the
+// user hides/restores it there. A top-level render would lock the item to the
+// bar forever — the host ignores `data` the moment a contribution carries its
+// own render, and an item with no menu name never appears in that menu.
+const registerBlock = source.match(/\/\/ REGISTER-BEGIN[^\n]*\n([\s\S]*?)\n[ \t]*\/\/ REGISTER-END/)
+assert.ok(registerBlock, 'plugin.js must contain the REGISTER-BEGIN..REGISTER-END block')
+const registration = registerBlock[1]
+assert.match(registration, /id:\s*'decode-speed'/)
+assert.match(registration, /data:\s*\{/)
+assert.match(registration, /id:\s*'hermes-decode-speed'/)
+assert.match(registration, /toggleLabel:\s*'デコード速度'/)
+// The registration declares exactly one render and it lives INSIDE `data` —
+// never a top-level render slot that would ignore the menu and lock the item.
+assert.equal((registration.match(/render:/g) || []).length, 1)
+const beforeData = registration.slice(
+  registration.indexOf('ctx.register'),
+  registration.indexOf('data:')
+)
+assert.ok(!beforeData.includes('render:'), 'the item render must live inside data, not at the top level')
+// The readout keeps the core item's own icon and label notation (Zap icon and
+// `… t/s`), showing '—' while nothing is measured yet.
+assert.match(source, /icons\.Zap/)
+assert.match(source, /t\/s/)
+
 console.log('desktop matcher tests passed')

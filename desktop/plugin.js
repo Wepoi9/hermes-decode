@@ -1,9 +1,9 @@
-import { STATUSBAR_AREAS, Tip, atom, computed, host, useValue } from '@hermes/plugin-sdk'
+import { STATUSBAR_AREAS, Tip, atom, computed, host, icons, useValue } from '@hermes/plugin-sdk'
 import { jsx } from 'react/jsx-runtime'
 
 const ID = 'hermes-decode'
-// ホバー説明: 完了済み呼び出しの計測結果であって、生成中のリアルタイム速度ではないことを書く。
-const DESCRIPTION = 'フォーカス中のセッションの直近10回の計測値（生成のリアルタイム速度ではない）'
+// ホバー説明: 直近10回のデコード速度だとだけ書く（履歴値である説明は泡では繰り返さない）。
+const DESCRIPTION = 'フォーカス中のセッションの直近10回のデコード速度'
 const latestSamples = atom([])
 // Samples arrive per (session, endpoint), newest-first, and the python window is
 // keyed the same way: another session never borrows a measurement, and one
@@ -70,13 +70,17 @@ const visibleSample = computed(
 
 function DecodeSpeed() {
   const sample = useValue(visibleSample)
-  const label = sample ? `↑ ${Math.trunc(sample.tokPerSecond)} tok/s` : '—'
+  // The core status-bar item reads `105 t/s` with a Zap icon and shows '—'
+  // while nothing is measured yet; the plugin keeps the identical icon and
+  // label notation so hiding the core item and showing this one swaps the
+  // readout, not the notation.
+  const label = sample ? `${Math.round(sample.tokPerSecond)} t/s` : '—'
 
   return jsx(Tip, {
     label: DESCRIPTION,
     children: jsx('span', {
-      className: 'px-1.5 text-[0.6875rem] text-(--ui-text-tertiary)',
-      children: label
+      className: 'inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem] text-(--ui-text-tertiary)',
+      children: [jsx(icons.Zap, { className: 'size-3' }, 'icon'), jsx('span', { children: label }, 'speed')]
     })
   })
 }
@@ -114,12 +118,26 @@ export default {
   name: 'Hermes Decode',
   defaultEnabled: false,
   register(ctx) {
+    // REGISTER-BEGIN (tests/desktop-match.test.mjs extracts this block verbatim)
+    // The bar item registers as a DATA contribution: `data` IS the bar's own
+    // StatusbarItem — its id, the bar's right-click menu name, and the render
+    // live inside it, so the item appears under "Show in status bar" and the
+    // user hides or restores it there like any core item (visibility persists
+    // in the app's own status-bar preferences). A top-level render would lock
+    // the item to the bar forever: the host ignores `data` the moment a
+    // contribution carries its own render, and an item with no menu name is
+    // never listed in that menu and always shows.
     ctx.register({
       id: 'decode-speed',
       area: STATUSBAR_AREAS.right,
       order: 130,
-      render: () => jsx(DecodeSpeed, {})
+      data: {
+        id: 'hermes-decode-speed',
+        toggleLabel: 'デコード速度',
+        render: () => jsx(DecodeSpeed, {})
+      }
     })
+    // REGISTER-END
 
     host.onEvent('plugin.hermes-decode.sample', event => {
       const parsed = parseSample(event)
