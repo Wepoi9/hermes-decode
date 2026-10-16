@@ -103,4 +103,32 @@ assert.equal(bounded.length, 8)
 assert.equal(bounded[0].tokPerSecond, 111)
 assert.ok(!bounded.some(item => item.sessionId === 's-8'))
 
+// A backend restart regenerates the connection identity, so the same session
+// would otherwise keep its pre-restart rows under a stale endpoint forever.
+// A sample under the newer generation retires the SAME session's pre-restart
+// rows so the readout is not stuck on a stale endpoint; another session's rows
+// are never touched, and a same-generation row is replaced without collateral.
+const preRestartRow = { sessionId: 's', provider: 'p1', model: 'm', conn: 'c-a', gen: 'g-old', tokPerSecond: 80 }
+const otherSessionPreRow = { sessionId: 's-other', provider: 'p1', model: 'm', conn: 'c-a', gen: 'g-old', tokPerSecond: 70 }
+const postRestartSample = { sessionId: 's', provider: 'p1', model: 'm', conn: 'c-b', gen: 'g-new', tokPerSecond: 120 }
+assert.deepEqual(
+  applyIncomingSample([preRestartRow, otherSessionPreRow], { sessionId: 's', conn: 'c-b', gen: 'g-new' }, postRestartSample, 'm'),
+  [postRestartSample, otherSessionPreRow]
+)
+// Even an unmeasured call under the new generation clears the stale endpoint.
+assert.deepEqual(
+  applyIncomingSample([preRestartRow], { sessionId: 's', conn: 'c-b', gen: 'g-new' }, null, 'm'),
+  []
+)
+// Same generation: the window's own row is replaced, nothing else retires.
+const sameGenRow = { sessionId: 's', provider: 'p1', model: 'm', conn: 'c-a', gen: 'g-new', tokPerSecond: 80 }
+const sameGenSample = { sessionId: 's', provider: 'p1', model: 'm', conn: 'c-a', gen: 'g-new', tokPerSecond: 120 }
+assert.deepEqual(
+  applyIncomingSample([sameGenRow], { sessionId: 's', conn: 'c-a', gen: 'g-new' }, sameGenSample, 'm'),
+  [sameGenSample]
+)
+// After the restart retires the pre-restart row, the window holds one endpoint
+// and reads its speed (it is never forced to '—' by a stale endpoint it no longer has).
+assert.equal(pickVisibleSample([postRestartSample], 's', 'm'), postRestartSample)
+
 console.log('desktop matcher tests passed')

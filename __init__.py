@@ -18,6 +18,14 @@ CONNAUTH_ID_LENGTH = 12
 # match a candidate URL against a published digest — the identity lives only in
 # this process's memory and dies with it.
 _CONNECTION_KEY = os.urandom(32)
+# The same per-process randomness also names the process generation: a backend
+# restart (or a plugin reload) regenerates the connection identity's key, so a
+# restarted backend cannot be told apart from its own earlier run by the opaque
+# endpoint ids alone. Publishing this one short id per call lets the desktop
+# retire a session's pre-restart rows when it sees the next generation arrive,
+# instead of keeping a stale endpoint alive and showing '—' forever.
+PROCESS_GENERATION_LENGTH = 12
+_PROCESS_GENERATION = hashlib.sha1(_CONNECTION_KEY).hexdigest()[:PROCESS_GENERATION_LENGTH]
 
 
 def _positive_finite(value):
@@ -179,6 +187,7 @@ def post_api_request(**kwargs):
         "provider": provider,
         "model": model,
         "conn": conn,
+        "gen": _PROCESS_GENERATION,
         "tok_per_sec": result["tok_per_sec"],
         "measured": result["measured"],
         "valid_samples": result["valid_samples"],

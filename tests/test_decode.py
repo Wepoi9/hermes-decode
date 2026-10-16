@@ -151,7 +151,24 @@ def test_hook_emits_minimal_payload(monkeypatch):
     assert event == "sample"
     assert payload == {"schema_version": 1, "session_id": "session", "provider": "provider",
                        "model": "model", "conn": plugin._conn_id("https://private.invalid"),
+                       "gen": plugin._PROCESS_GENERATION,
                        "tok_per_sec": 100, "measured": True, "valid_samples": 1}
+
+
+def test_generation_id_tracks_the_process_lifecycle():
+    # A backend restart (or a plugin reload: a fresh import) regenerates the
+    # connection identity's key, so the same session would otherwise keep its
+    # pre-restart rows under a stale endpoint and show '—' forever. The payload
+    # carries one opaque generation id per process so the desktop can tell a
+    # restarted backend's samples from the previous run's and drop the stale
+    # rows: stable for the life of this process, different for the next one.
+    assert plugin._PROCESS_GENERATION == plugin._PROCESS_GENERATION
+    assert len(plugin._PROCESS_GENERATION) == plugin.PROCESS_GENERATION_LENGTH
+    fresh_spec = importlib.util.spec_from_file_location("hermes_decode_gen_fresh", MODULE_PATH)
+    fresh = importlib.util.module_from_spec(fresh_spec)
+    fresh_spec.loader.exec_module(fresh)
+    assert fresh._PROCESS_GENERATION != plugin._PROCESS_GENERATION
+    assert fresh._PROCESS_GENERATION == fresh._PROCESS_GENERATION
 
 
 def test_hook_without_identity_stays_silent(monkeypatch):
