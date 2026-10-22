@@ -1,8 +1,8 @@
 diff --git a/agent/agent_init.py b/agent/agent_init.py
-index 58ed7e0e30..c0755cf038 100644
+index 59006475de..063f7c5696 100644
 --- a/agent/agent_init.py
 +++ b/agent/agent_init.py
-@@ -2274,6 +2274,8 @@ _USAGE_STATE: dict[str, Any] = {
+@@ -2243,6 +2243,8 @@ _USAGE_STATE: dict[str, Any] = {
      # Status-bar latency/velocity history (last 10 calls), shared by loop + codex_runtime.
      "_api_latency_history": lambda: deque(maxlen=10),
      "_api_output_history": lambda: deque(maxlen=10),
@@ -12,10 +12,10 @@ index 58ed7e0e30..c0755cf038 100644
  
  
 diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
-index 01c26afe7a..c4a98c878a 100644
+index a934965401..456259c6bb 100644
 --- a/agent/chat_completion_helpers.py
 +++ b/agent/chat_completion_helpers.py
-@@ -2748,6 +2748,9 @@ class _StreamingCall(StreamingWaitMonitor):
+@@ -2717,6 +2717,9 @@ class _StreamingCall(StreamingWaitMonitor):
          self._request_cancelled = {"value": False}
          self.first_delta_fired = {"done": False}
          self.deltas_were_sent = {"yes": False}  # for the partial-delivery fallback
@@ -25,9 +25,9 @@ index 01c26afe7a..c4a98c878a 100644
          self.provider_tool_in_flight = {"yes": False}
          # Last REAL chunk; the monitor detects SSE-ping-only connections with it.
          self.last_chunk_time = {"t": time.time()}
-@@ -2812,6 +2815,9 @@ class _StreamingCall(StreamingWaitMonitor):
-         # Attempt-local like provider_tool_in_flight: a tool name from a stream that died
-         # before any text must not label a later attempt's partial stub or its retry decision.
+@@ -2782,6 +2785,9 @@ class _StreamingCall(StreamingWaitMonitor):
+         # its tool name (died before any text) must not label a later partial stub or retry.
+         self.provider_tool_in_flight["yes"], self.prompt_progress["progress"] = False, None
          self.result["partial_tool_names"] = []
 +        # Every attempt's decode window opens with that attempt's OWN first real-data delta:
 +        # a stamp inherited from a dropped attempt would measure the retry backoff as decode.
@@ -35,7 +35,7 @@ index 01c26afe7a..c4a98c878a 100644
          return attempt_id
  
      def _cancel_current_stream_attempt(self, reason: str) -> None:
-@@ -2848,12 +2854,31 @@ class _StreamingCall(StreamingWaitMonitor):
+@@ -2818,12 +2824,31 @@ class _StreamingCall(StreamingWaitMonitor):
              stream_attempt_id, discarded_chunks, discarded_bytes,
          )
  
@@ -70,7 +70,7 @@ index 01c26afe7a..c4a98c878a 100644
          self._fire_first_delta()
          self.agent._fire_stream_delta(text)
          self.deltas_were_sent["yes"] = True
-@@ -2865,10 +2890,12 @@ class _StreamingCall(StreamingWaitMonitor):
+@@ -2835,10 +2860,12 @@ class _StreamingCall(StreamingWaitMonitor):
          return bool((getattr(self.agent, "_current_streamed_assistant_text", "") or "").strip())
  
      def _emit_reasoning(self, text: str) -> None:
@@ -83,7 +83,7 @@ index 01c26afe7a..c4a98c878a 100644
          self._fire_first_delta()
          self.agent._fire_tool_gen_started(name)
  
-@@ -3225,6 +3252,10 @@ class _StreamingCall(StreamingWaitMonitor):
+@@ -3219,6 +3246,10 @@ class _StreamingCall(StreamingWaitMonitor):
          if runaway:
              # Cut, not finished: the length path ends the turn on this mark instead of continuing.
              response._runaway_repetition = True
@@ -94,7 +94,7 @@ index 01c26afe7a..c4a98c878a 100644
          return response
  
      def _log_runaway_cut(self, channel: str) -> None:
-@@ -3494,6 +3525,10 @@ class _StreamingCall(StreamingWaitMonitor):
+@@ -3488,6 +3519,10 @@ class _StreamingCall(StreamingWaitMonitor):
              message._runaway_repetition = True  # same hand-off as the chat_completions wire
              return message
          if base_final_message is not None:
@@ -106,7 +106,7 @@ index 01c26afe7a..c4a98c878a 100644
              if not stream.output_modified:
                  return self._check_anthropic_message(base_final_message)
 diff --git a/agent/codex_runtime.py b/agent/codex_runtime.py
-index 8794219f8d..3d2e4e0707 100644
+index 11ad5243c4..a3d1619972 100644
 --- a/agent/codex_runtime.py
 +++ b/agent/codex_runtime.py
 @@ -862,6 +862,10 @@ class _CodexResponseAssembler:
