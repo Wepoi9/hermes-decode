@@ -10,7 +10,8 @@ PLUGIN_ID = "hermes-decode"
 # repeats them (desktop/plugin.js) because the two halves cannot import each
 # other: tests/desktop-match.test.mjs asserts the numbers still match this file.
 WINDOW_SIZE = 10          # completed calls kept per (session, endpoint) window
-MAX_DECODE_WINDOWS = 8    # windows retained at once (LRU), mirrored by the row cap
+MAX_DECODE_WINDOWS = 8    # windows retained at once (LRU); the Desktop half caps
+                          # the same number, but counts sessions, not windows
 SCHEMA_VERSION = 2        # payload contract version the Desktop half checks
 
 

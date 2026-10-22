@@ -56,14 +56,15 @@ assert.equal(declared(contract, 'desktop SCHEMA_VERSION', '^const SCHEMA_VERSION
 assert.ok(!source.includes('payload.conn'), 'the payload carries no endpoint identity')
 assert.ok(!source.includes('payload.gen'), 'the payload carries no process generation id')
 
-// The handler stores one row per session, newest first.
-const newer = { sessionId: 's-focused', provider: 'p1', model: 'm', tokPerSecond: 120 }
-const older = { sessionId: 's-focused', provider: 'p1', model: 'm', tokPerSecond: 80 }
-const otherSession = { sessionId: 's-other', provider: 'p1', model: 'm', tokPerSecond: 300 }
-const otherModel = { sessionId: 's-focused', provider: 'p1', model: 'other-model', tokPerSecond: 400 }
+// The handler stores one row per session, newest first. A row carries only
+// what the readout reads: the session it belongs to and its speed.
+const newer = { sessionId: 's-focused', tokPerSecond: 120 }
+const older = { sessionId: 's-focused', tokPerSecond: 80 }
+const otherSession = { sessionId: 's-other', tokPerSecond: 300 }
+const recordedUnderAnotherModel = { sessionId: 's-focused', tokPerSecond: 400 }
 
 // The readout follows the FOCUSED session only: the newest measurement for
-// that session is the readout (the matcher never narrows by model; see below).
+// that session is the readout.
 assert.equal(pickVisibleSample([newer, older], 's-focused'), newer)
 assert.equal(pickVisibleSample([older], 's-focused'), older)
 
@@ -73,19 +74,14 @@ assert.equal(pickVisibleSample([otherSession], 's-focused'), null)
 assert.equal(pickVisibleSample([newer, older], 's-tab-b'), null)
 assert.equal(pickVisibleSample([otherSession, newer], 's-focused'), newer)
 
-// A session that switched connection endpoint keeps ONE row: the newest
-// measurement answers the readout instead of the session becoming ambiguous.
-assert.equal(pickVisibleSample([newer], 's-focused'), newer)
-
-// The matcher never narrows by model: the host cannot resolve the focused
-// session's own model, and borrowing the main model's slug for that would
-// point a tab's readout at a model it is not running. So the newest sample of
-// the focused session wins regardless of which model recorded it — per-model
-// freshness lives in the windows (python resets the decode history on a model
-// change, so a new model's first sample carries its own history).
-assert.equal(pickVisibleSample([otherModel], 's-focused'), otherModel)
-assert.equal(pickVisibleSample([newer, otherModel], 's-focused'), newer)
-assert.equal(pickVisibleSample([otherModel, newer], 's-focused'), otherModel)
+// The matcher never narrows by model, and cannot: the python half resets the
+// session's decode history on a model change, and a row carries no model field
+// at all (the SDK does not expose the focused session's own model, and
+// borrowing the main model's slug would point a tab at a model it is not
+// running). So any row of the focused session is eligible, newest first.
+assert.equal(pickVisibleSample([recordedUnderAnotherModel], 's-focused'), recordedUnderAnotherModel)
+assert.equal(pickVisibleSample([newer, recordedUnderAnotherModel], 's-focused'), newer)
+assert.equal(pickVisibleSample([recordedUnderAnotherModel, newer], 's-focused'), recordedUnderAnotherModel)
 
 // No focused session (null/empty), malformed input, or junk entries never crash the readout.
 assert.equal(pickVisibleSample([newer], null), null)
@@ -95,13 +91,14 @@ assert.equal(pickVisibleSample(null, 's-focused'), null)
 assert.equal(pickVisibleSample([null, newer, older], 's-focused'), newer)
 
 // The desktop cache keeps ONE row per session: the incoming sample replaces
-// that session's row, whichever connection endpoint recorded it.
-const oldRow = { sessionId: 's', provider: 'p1', model: 'm', tokPerSecond: 80 }
-const newRow = { sessionId: 's', provider: 'p2', model: 'm', tokPerSecond: 120 }
+// that session's row, whichever connection endpoint recorded it (the endpoint
+// only keys the python windows, so a switch arrives as an ordinary sample).
+const oldRow = { sessionId: 's', tokPerSecond: 80 }
+const newRow = { sessionId: 's', tokPerSecond: 120 }
 assert.deepEqual(applyIncomingSample([oldRow], 's', newRow), [newRow])
 
 // Another session's rows are never touched.
-const otherSessionRow = { sessionId: 's-other', provider: 'p1', model: 'm', tokPerSecond: 70 }
+const otherSessionRow = { sessionId: 's-other', tokPerSecond: 70 }
 assert.deepEqual(applyIncomingSample([oldRow, otherSessionRow], 's', newRow), [newRow, otherSessionRow])
 
 // The latest call measured nothing: that session's row goes, so the readout
@@ -112,11 +109,9 @@ assert.equal(pickVisibleSample(applyIncomingSample([oldRow], 's', null), 's'), n
 
 // The row list is bounded: at most one row per session, MAX_ROWS sessions.
 const many = Array.from({ length: 9 }, (_unused, index) => ({
-  sessionId: `s-${index}`, provider: 'p', model: 'm', tokPerSecond: 50 + index
+  sessionId: `s-${index}`, tokPerSecond: 50 + index
 }))
-const bounded = applyIncomingSample(many, 's-new', {
-  sessionId: 's-new', provider: 'p', model: 'm', tokPerSecond: 111
-})
+const bounded = applyIncomingSample(many, 's-new', { sessionId: 's-new', tokPerSecond: 111 })
 assert.equal(bounded.length, 8)
 assert.equal(bounded[0].tokPerSecond, 111)
 assert.ok(!bounded.some(item => item.sessionId === 's-8'))
@@ -138,7 +133,9 @@ const unmeasuredFrame = {
 }
 assert.deepEqual(parseSample(measuredFrame), {
   sessionId: 's',
-  sample: { sessionId: 's', provider: 'p', model: 'm', tokPerSecond: 120 }
+  // The row keeps only what the readout reads; provider and model stay in the
+  // payload as contract fields, not as stored state.
+  sample: { sessionId: 's', tokPerSecond: 120 }
 })
 assert.deepEqual(parseSample(unmeasuredFrame), { sessionId: 's', sample: null })
 
@@ -148,6 +145,9 @@ assert.equal(parseSample({ payload: { ...unmeasuredFrame.payload, schema_version
 assert.equal(parseSample({ payload: { ...measuredFrame.payload, tok_per_sec: 0 } }), null)
 assert.equal(parseSample({ payload: { ...measuredFrame.payload, tok_per_sec: Number.NaN } }), null)
 assert.equal(parseSample({ payload: { ...measuredFrame.payload, valid_samples: 0 } }), null)
+// A frame missing one of the identity fields is not this contract's frame.
+assert.equal(parseSample({ payload: { ...measuredFrame.payload, provider: '' } }), null)
+assert.equal(parseSample({ payload: { ...measuredFrame.payload, model: undefined } }), null)
 assert.equal(parseSample(null), null)
 assert.equal(parseSample({}), null)
 
@@ -184,5 +184,8 @@ assert.ok(!beforeData.includes('render:'), 'the item render must live inside dat
 // `… t/s`), showing '—' while nothing is measured yet.
 assert.match(source, /icons\.Zap/)
 assert.match(source, /t\/s/)
+// The subscription listens on the event namespaced by the plugin id, matching
+// the python half's broadcast_plugin_event(PLUGIN_ID, 'sample', payload).
+assert.match(source, /host\.onEvent\(`plugin\.\$\{ID\}\.sample`/)
 
 console.log('desktop matcher tests passed')

@@ -23,6 +23,14 @@ def test_ratio_of_sums_not_mean_of_rates():
     assert result["tok_per_sec"] != (60 + 45) / 2
 
 
+def test_speed_is_rounded_half_up_like_the_core_item():
+    # 3 tokens over 2 seconds is exactly 1.5: the published value must round
+    # half up (the core status-bar item's `Math.round`), not truncate.
+    state = plugin.DecodeAggregator()
+    assert state.record("s", "m", None, {"output_tokens": 3}, 2)["tok_per_sec"] == 2
+    assert state.record("s2", "m", None, {"output_tokens": 5}, 2)["tok_per_sec"] == 3
+
+
 def test_unmeasured_latest_call_reports_no_current_speed():
     state = plugin.DecodeAggregator()
     state.record("s", "m", None, {"output_tokens": 300}, 3)
@@ -83,27 +91,37 @@ def test_model_change_resets_the_session_history():
     assert state.history_for("s", None)[0] == (200.0, 4.0)
 
 
-def test_hook_sessions_share_nothing(monkeypatch):
+def emitted_hooks(monkeypatch, calls):
+    """Run the hook on a fresh aggregator and return the payloads it broadcast."""
     emitted = []
-    monkeypatch.setattr(plugin, "_broadcast", lambda event, payload: emitted.append(payload))
+    monkeypatch.setattr(plugin, "_broadcast", lambda event, payload: emitted.append((event, payload)))
     plugin._AGGREGATOR = plugin.DecodeAggregator()
-    plugin.post_api_request(session_id="first", provider="p", model="m",
-                            usage={"output_tokens": 200}, decode_seconds=2)
-    plugin.post_api_request(session_id="second", provider="p", model="m",
-                            usage={"output_tokens": 200}, decode_seconds=5)
+    for call in calls:
+        plugin.post_api_request(**call)
+    # Every sample frame travels under the one event name the Desktop half subscribes to.
+    assert {event for event, _payload in emitted} == {"sample"} or emitted == []
+    return [payload for _event, payload in emitted]
+
+
+def test_hook_sessions_share_nothing(monkeypatch):
+    emitted = emitted_hooks(monkeypatch, [
+        {"session_id": "first", "provider": "p", "model": "m",
+         "usage": {"output_tokens": 200}, "decode_seconds": 2},
+        {"session_id": "second", "provider": "p", "model": "m",
+         "usage": {"output_tokens": 200}, "decode_seconds": 5},
+    ])
     assert [payload["valid_samples"] for payload in emitted] == [1, 1]
     assert [payload["tok_per_sec"] for payload in emitted] == [100, 40]
     assert [emitted[-1]["session_id"], emitted[-2]["session_id"]] == ["second", "first"]
 
 
 def test_another_model_never_borrows_the_window(monkeypatch):
-    emitted = []
-    monkeypatch.setattr(plugin, "_broadcast", lambda event, payload: emitted.append(payload))
-    plugin._AGGREGATOR = plugin.DecodeAggregator()
-    plugin.post_api_request(session_id="s", provider="p", model="m1",
-                            usage={"output_tokens": 200}, decode_seconds=2)
-    plugin.post_api_request(session_id="s", provider="p", model="m2",
-                            usage={"output_tokens": 200}, decode_seconds=2)
+    emitted = emitted_hooks(monkeypatch, [
+        {"session_id": "s", "provider": "p", "model": "m1",
+         "usage": {"output_tokens": 200}, "decode_seconds": 2},
+        {"session_id": "s", "provider": "p", "model": "m2",
+         "usage": {"output_tokens": 200}, "decode_seconds": 2},
+    ])
     assert [payload["valid_samples"] for payload in emitted] == [1, 1]
 
 
@@ -120,13 +138,11 @@ def test_endpoint_key_is_normalized_and_stays_in_process():
 
 
 def test_payload_carries_no_endpoint_or_generation_identity(monkeypatch):
-    emitted = []
-    monkeypatch.setattr(plugin, "_broadcast", lambda event, payload: emitted.append(payload))
-    plugin._AGGREGATOR = plugin.DecodeAggregator()
-    plugin.post_api_request(session_id="s", provider="p", model="m",
-                            usage={"output_tokens": 200}, decode_seconds=2,
-                            base_url="https://private.invalid")
-    payload = emitted[-1]
+    payload = emitted_hooks(monkeypatch, [
+        {"session_id": "s", "provider": "p", "model": "m",
+         "usage": {"output_tokens": 200}, "decode_seconds": 2,
+         "base_url": "https://private.invalid"},
+    ])[-1]
     # The endpoint never reaches the desktop half: no URL, no digest of it, and
     # no process-generation id either.
     assert "conn" not in payload and "gen" not in payload
@@ -153,26 +169,22 @@ def test_invalid_metrics_and_usage_are_unmeasured():
 
 
 def test_hook_emits_minimal_payload(monkeypatch):
-    emitted = []
-    monkeypatch.setattr(plugin, "_broadcast", lambda event, payload: emitted.append((event, payload)))
-    plugin._AGGREGATOR = plugin.DecodeAggregator()
-    plugin.post_api_request(session_id="session", provider="provider", model="model",
-                            usage={"output_tokens": 300}, decode_seconds=3,
-                            response="private", base_url="https://private.invalid")
-    event, payload = emitted[-1]
-    assert event == "sample"
+    payload = emitted_hooks(monkeypatch, [
+        {"session_id": "session", "provider": "provider", "model": "model",
+         "usage": {"output_tokens": 300}, "decode_seconds": 3,
+         "response": "private", "base_url": "https://private.invalid"},
+    ])[-1]
     assert payload == {"schema_version": 2, "session_id": "session", "provider": "provider",
                        "model": "model", "tok_per_sec": 100, "measured": True,
                        "valid_samples": 1}
 
 
 def test_hook_without_identity_stays_silent(monkeypatch):
-    emitted = []
-    monkeypatch.setattr(plugin, "_broadcast", lambda event, payload: emitted.append(payload))
-    plugin._AGGREGATOR = plugin.DecodeAggregator()
-    for kwargs in [{"provider": "p", "model": "m"}, {"session_id": "s", "model": "m"},
-                   {"session_id": "s", "provider": "", "model": "m"}]:
-        plugin.post_api_request(**kwargs)
+    emitted = emitted_hooks(monkeypatch, [
+        {"provider": "p", "model": "m"},
+        {"session_id": "s", "model": "m"},
+        {"session_id": "s", "provider": "", "model": "m"},
+    ])
     assert emitted == []
 
 

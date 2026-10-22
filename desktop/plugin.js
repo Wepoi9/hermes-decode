@@ -13,7 +13,7 @@ const SCHEMA_VERSION = 2
 // Hover tip: says only that the readout is the focused session's last WINDOW_SIZE decode
 // speeds — the history explanation is not repeated in the tooltip.
 const DESCRIPTION = `フォーカス中のセッションの直近${WINDOW_SIZE}回のデコード速度`
-const latestSamples = atom([])
+const sessionRows = atom([])
 // One row per session, newest first. The python half keeps the per-endpoint
 // windows and reports the readout of the call that just finished, so the
 // desktop half only has to remember the newest result of each session: the
@@ -21,9 +21,9 @@ const latestSamples = atom([])
 // never shown, and a session that switches connection endpoint simply
 // replaces its own row instead of becoming ambiguous.
 // MATCHER-BEGIN (tests/desktop-match.test.mjs extracts this block verbatim)
-export function pickVisibleSample(samples, sessionId) {
-  if (!Array.isArray(samples) || typeof sessionId !== 'string' || !sessionId) return null
-  return samples.find(item => item && item.sessionId === sessionId) || null
+export function pickVisibleSample(rows, sessionId) {
+  if (!Array.isArray(rows) || typeof sessionId !== 'string' || !sessionId) return null
+  return rows.find(item => item && item.sessionId === sessionId) || null
 }
 // MATCHER-END
 // CACHE-BEGIN (tests/desktop-match.test.mjs extracts this block verbatim)
@@ -40,8 +40,8 @@ export function applyIncomingSample(rows, sessionId, sample) {
 // running, so the matcher narrows by session only: the newest sample of the
 // focused session wins regardless of which model recorded it.
 const visibleSample = computed(
-  [latestSamples, host.state.focusedStoredSessionId],
-  (samples, sessionId) => pickVisibleSample(samples, sessionId)
+  [sessionRows, host.state.focusedStoredSessionId],
+  (rows, sessionId) => pickVisibleSample(rows, sessionId)
 )
 
 function DecodeSpeed() {
@@ -70,6 +70,10 @@ function parseSample(event) {
   const model = payload.model
   const version = payload.schema_version
 
+  // provider and model are contract fields — a frame without them comes from a
+  // different producer — but the readout never reads them back: a row is a
+  // session's newest result, and the SDK cannot resolve the focused session's
+  // own model to compare against anyway.
   if (version !== SCHEMA_VERSION || typeof sessionId !== 'string' || !sessionId || typeof provider !== 'string' || !provider || typeof model !== 'string' || !model) return null
   if (!payload.measured) {
     // The latest call was not measured: clear that session's readout.
@@ -80,7 +84,7 @@ function parseSample(event) {
   if (!Number.isInteger(sampleCount) || sampleCount <= 0) return null
   if (typeof speed !== 'number' || !Number.isFinite(speed) || speed <= 0) return null
 
-  return { sessionId, sample: { sessionId, provider, model, tokPerSecond: speed } }
+  return { sessionId, sample: { sessionId, tokPerSecond: speed } }
 }
 // PARSE-END
 
@@ -110,10 +114,12 @@ export default {
     })
     // REGISTER-END
 
-    host.onEvent('plugin.hermes-decode.sample', event => {
+    // The event name is namespaced by this plugin's id, matching the python
+    // half's broadcast_plugin_event(PLUGIN_ID, 'sample', payload).
+    host.onEvent(`plugin.${ID}.sample`, event => {
       const parsed = parseSample(event)
       if (!parsed) return
-      latestSamples.set(applyIncomingSample(latestSamples.get(), parsed.sessionId, parsed.sample))
+      sessionRows.set(applyIncomingSample(sessionRows.get(), parsed.sessionId, parsed.sample))
     })
   }
 }
