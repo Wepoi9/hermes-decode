@@ -14,7 +14,7 @@ plugin.yaml                 # 本体フック post_api_request のみ宣言（�
 __init__.py                 # 集計（直近10件の窓・合算比）と Desktop へのイベント通知
 desktop/plugin.js           # Desktop 表示（STATUSBAR_AREAS.right にメニューで切り替え可能な 1 項目のみ、フォーカス中セッション追従）
 patches/decode-hook.patch        # 本体が上流で計測を受け付けるまでの一時的な計測配線（上流 main 基準）
-patches/decode-hook-v0.22.2.patch # 公開済み v0.22.2 を動かしている間の計測配線（v0.22.2 タグ基準）
+patches/decode-hook-v0.22.4.patch # 公開済み v0.22.4 を動かしている間の計測配線（v0.22.4 タグ基準）
 tests/test_decode.py        # 集計の正確性と異常値・境界値・同時呼び出し・再読込の自動テスト
 tests/desktop-match.test.mjs # 表示マッチャー（セッション不一致・接続先混在時 `—`）の依存なしテスト
 THIRD_PARTY_NOTICES.md      # 本体パッチが上流派生コードを含むことの明示（著作権表示）
@@ -34,24 +34,24 @@ THIRD_PARTY_NOTICES.md      # 本体パッチが上流派生コードを含む�
 ## 動作条件
 
 - **ストリーミング応答のみ計測対象です。** 非ストリーミング応答、中断されたストリーム、置き換えられたストリーム、失敗した呼び出し、部分応答は未計測となり、窓には入りますが合計へ混ざりません。
-- Hermes 本体が `post_api_request` フックへ `decode_seconds`（有限な正の float、または `None`）を渡します。**上流がまだ計測に対応していない間、このリポジトリだけを入れても数値は出ません。** 公表済みの公式 v0.22.2 でも `post_api_request` へ `decode_seconds` は無く、本体パッチ（v0.22.2 基準）を適用しないと速度は出ません。本体パッチを適用するか、対応する上流 PR がマージされたリリースを利用してください。切り替え後は本体ビルドインプラグインを有効化するだけで、本体パッチと上流の旧実装を削除できます。
+- Hermes 本体が `post_api_request` フックへ `decode_seconds`（有限な正の float、または `None`）を渡します。**上流がまだ計測に対応していない間、このリポジトリだけを入れても数値は出ません。** 公表済みの公式 v0.22.4 でも `post_api_request` へ `decode_seconds` は無く、本体パッチ（v0.22.4 基準）を適用しないと速度は出ません。本体パッチを適用するか、対応する上流 PR がマージされたリリースを利用してください。切り替え後は本体ビルドインプラグインを有効化するだけで、本体パッチと上流の旧実装を削除できます。
 
 ## 本体パッチ（同一内容・二つの基準）
 
 本体側の変更は、デコード時間を計測し、既存の `post_api_request` に省略可能な `decode_seconds` として渡すことだけに限定しています。窓の管理・集計・表示・ローカライズは本体には持ち込みません。両基準の中身は同一です。
 
-- 上流 main 基準（`patches/decode-hook.patch`）: 基準コミット `9c002cb941de1e1708294d0cd58e060b6a417b5e`、由来（開発元 fork の PR ブランチ先端）`eeac6734cd25c0e39622806b2388c65be26b2505`。上流 PR 向けで、上流が受け付けた後の `--reverse` はこちらです。
-- v0.22.2 基準（`patches/decode-hook-v0.22.2.patch`）: 基準コミット `d923a5eb487a17c0a68801bba9ef0f56c81040a8`（v0.22.2 タグ）。公表済み v0.22.2 を動かしている間だけ使い、上流が計測をマージしたリリースに切り替えたら不要になります。
+- 上流 main 基準（`patches/decode-hook.patch`）: 基準コミット `4e58c721c8cf9b51c46636ea84ea6a5cb540880a`、由来（開発元 fork の PR ブランチ先端）`0bbdee3787…`。上流 PR 向けで、上流が受け付けた後の `--reverse` はこちらです。
+- v0.22.4 基準（`patches/decode-hook-v0.22.4.patch`）: 基準コミット `4d04303818b61bf3aa09278af48356315515965b`（v0.22.4 タグ）。公表済み v0.22.4 を動かしている間だけ使い、上流が計測をマージしたリリースに切り替えたら不要になります。
 
-両基準で計測配線を受ける 7 ファイルのうち 4 ファイル（`agent/codex_runtime.py`、`agent/turn_api_request.py`、`agent/turn_response_intake.py`、chat 側テストファイル）はパッチ生成物がバイト一致、残り 3 ファイルは表記だけの差分で計測内容は同一です（`agent/agent_init.py` と `agent/chat_completion_helpers.py` は挿入箇所の周囲のコメント表記、Codex 側テストファイルは mock 時計ヘルパーの teardown 耐性表記の違いだけです。Codex 側の差異の根拠は下の統合再検証）。
+2026-10-22 の時点で、上流 main と v0.22.4 タグは計測配線の 7 ファイルで同じ内容なので、2 つのパッチファイルはバイト一致です（SHA-256 `DD84814F293777012313F5A1B0F7B8251BDCF3F4237B76C43E8A72F44D0C8137`）。違うのは基準コミットと適用先だけです。計測内容はどちらの基準でも同じなので、上の 2 行の基準コミットで適用先を見分けてください。
 
 ```bash
 git apply --check patches/decode-hook.patch   # 適用前チェック（上流 main 基準）
 git apply patches/decode-hook.patch           # 適用（上流 main 基準）
 git apply --reverse patches/decode-hook.patch # 本体が上流 PR で受け付けた後は元に戻す
-git apply --check patches/decode-hook-v0.22.2.patch   # 適用前チェック（v0.22.2 基準）
-git apply patches/decode-hook-v0.22.2.patch           # 適用（v0.22.2 基準）
-git apply --reverse patches/decode-hook-v0.22.2.patch # v0.22.2 を上流マージ待ちリリースへ切り替える時に元に戻す
+git apply --check patches/decode-hook-v0.22.4.patch   # 適用前チェック（v0.22.4 基準）
+git apply patches/decode-hook-v0.22.4.patch           # 適用（v0.22.4 基準）
+git apply --reverse patches/decode-hook-v0.22.4.patch # v0.22.4 を上流マージ待ちリリースへ切り替える時に元に戻す
 ```
 
 ## 計測と表示の契約（イベント payload）
@@ -107,11 +107,11 @@ decode 側の注記: 計測できなかった呼び出し（`decode_seconds = No
 
 本体側の計測テスト（上流 Hermes のテストスイート、パッチに含まれる）: 各呼び出しのストリーム・試行単位で計測状態が初期化され、最初の delta 受信前や待機後の tool 開始通知が計測を開始しないこと、最初の delta 以降の tool 開始通知が計測を上書きしないこと、Codex 側では生成物を伴わない announce 通知が窓を開けず、実データを伴う delta が窓を開けること、Codex 側の窓は確定したクリーンな完了終端でのみ閉じられ（failed・incomplete・部分応答は `None`）、リクエストの試行時に `_last_api_decode_seconds` がリセットされること、`decode_seconds` の公開が非ストリーミングでは `None`、`0` 以下・非有限値では `None` になること。
 
-- 実行結果: PR 基準コミットのチェックアウトで `tests/agent/test_first_chunk_at_hook.py` と `tests/agent/test_codex_first_event_timing.py` を実行し `26 passed`（Anthropic 配列ストリームのデコード窓テスト 2 件を含みます。`message_stop` まで届いた応答は計測され、EOF で切れた部分応答は `None` のまま）、開発主分支のチェックアウトでデコード・速度表示・ステータスバー関連の既存テストを一部のテストを除外して実行し、`59 passed`（既存の履歴契約を保持）を確認しました。公開 CI は毎 push で同じ計測テストを適用済みツリーへ実行し、PR 基準コミットのジョブで `26 passed`、v0.22.2 タグコミットのジョブで `9 passed`（クリーンな Python 3.14 環境。core の実行依存はこのバージョンのマーカーから入り、テスト道具は上流の固定版を使います）を確認しました。
+- 実行結果: PR 基準コミットのチェックアウトで `tests/agent/test_first_chunk_at_hook.py` と `tests/agent/test_codex_first_event_timing.py` を実行し `26 passed`（Anthropic 配列ストリームのデコード窓テスト 2 件を含みます。`message_stop` まで届いた応答は計測され、EOF で切れた部分応答は `None` のまま）、開発主分支のチェックアウトでデコード・速度表示・ステータスバー関連の既存テストを一部のテストを除外して実行し、`59 passed`（既存の履歴契約を保持）を確認しました。公開 CI は毎 push で同じ計測テストを適用済みツリーへ実行し、main 基準コミットのジョブと v0.22.4 タグコミットのジョブの両方で `26 passed`（クリーンな Python 3.14 環境。core の実行依存はこのバージョンのマーカーから入り、テスト道具は上流の固定版を使います）を確認します。
 - 統合再検証（2026-10-16、監査対応で上流 PR を最新 main へ追従）: fork ブランチの3コミットを上流 main `9c002cb941…` へリベースして PR head を `0e4f0bd2…` → `eeac6734cd25c0e39622806b2388c65be26b2505` に更新し、`patches/decode-hook.patch` を新基準の差分どおりに再生成しました（差分は7ファイル・560追加/7削除）。3コミットとも3-way マージで衝突なしに再生し、旧基準 `cca83848ec…` では上流が `agent/agent_init.py` の `_USAGE_STATE` 辞書隣接のコメント行を削除したことで `git apply` が1ハンク reject していましたが、新基準では適用チェックが通ります。追従後のツリーで両計測テストを `26 passed`・エラー0で確認済み（同時に Codex mock 時計を列が尽きたあとも最後の刻みを返す形へ堅牢化。上流 conftest がテスト後にループを閉じる際、Windows の proactor shutdown が `time.monotonic()` を呼ぶ teardown で StopIteration→RuntimeError になっていたのを防いだ）。リベース後も上流 main は継続して前進しています（執筆時点の先端 `f974134f`、直後の3コミットは当パッチの7ファイル領域への変更なしを確認済み）。
 - Codex 側の計測テストは決定論的な mock `time.monotonic()`（事前に用意した進行列で時計を進め、実待ちを一切挟まない。列が尽きたあとは最後の刻みを返し、テストの teardown で `time.monotonic()` を呼ぶ環境側の後始末を壊しません）で動きます。chat 側の窓テストは従来どおり chunk の間に実際の待機時間（50 ms 以上）を挟み、実際のデコード窓を作って計測値を要求しています（Windows では直前・直後の 2 回の読みが同一 tick に潰れることがあり、応答が即座に揃うタスクでは窓が 0.0 秒＝未計測になるため）。
-- v0.22.2 基準のパッチ: Windows の実チェックアウト（v0.22.2 タグコミット）で `git apply --check`・適用・`--check --reverse` がすべて成功し、変更が上記 7 ファイルのみであることを確認しました（CI も同タグコミットへ同じチェックと、適用後の Codex 計測テスト実行 `9 passed` を毎 push しています）。専用パッチ適用済みの v0.22.2 チェックアウトで `tests/agent/test_codex_first_event_timing.py` を実行し `9 passed`（mock 時計の決定論的計測、90.5 秒超の窓を含む）を確認しました。同じチェックアウトのパッチには Anthropic の chat 側デコード窓テストも入っていますが、このツリーでは下の import 時不具合で実行できないため、Anthropic 部分はパッチの適用のみ検証済みです（テスト実行は PR 基準コミットのツリーでしています）。
-- chat 側の窓テストは v0.22.2 のリリースツリーでは実行できません。公式リリース側固有の import 時不具合で、`import tui_gateway.server` が `tui_gateway/methods_onboarding.py` 71 行目の型注記が `Path` を pathlib なしで参照して `NameError` をモジュール読込中に起こして止まります（同じリリースの `tui_gateway/server.py` にモジュールレベルで参照される `_flush_sessions_before_exit` の定義が `tui_gateway/session_reaper.py` 側にしかない同種の問題もあります。v0.22.2 タグコミットの直接 import とツリー grep で確認済み。本体デコード経路・当パッチとは無関係）。このため v0.22.2 では chat 系 pytest は未実行のままです（リリース側固有の問題で、計測配線・当パッチとは無関係。同じ内容の計測テストは PR 基準コミットのチェックアウトで chat 側含めて `26 passed`＝上の実行結果）。Desktop を使った表示・compaction・バックエンド再起動の実機 E2E は、v0.22.2 基準パッチ適用済みの本体で別途成功しています（下の実機 E2E）。chat 系 pytest がリリース ツリーで収集できるようになるまで、「v0.22.2 完全対応」とは表記しません。
+- v0.22.4 基準のパッチ: Windows の実チェックアウト（v0.22.4 タグコミット `4d04303818…`）で `git apply --check`・適用が成功し、変更が上記 7 ファイルのみであることを確認しました。専用パッチ適用済みの v0.22.4 チェックアウトで `tests/agent/test_first_chunk_at_hook.py` と `tests/agent/test_codex_first_event_timing.py` を実行し `26 passed`（mock 時計の決定論的計測、90.5 秒超の窓を含む）を確認しました。v0.22.2 で見られていた chat 側の import 時不具合は v0.22.4 では解消しているため、リリースツリーでも chat 側の窓テストまで実行できます。CI も同タグコミットへ同じチェックと、適用後の計測テスト 2 ファイルの実行を毎 push しています。
+- 統合再検証（2026-10-22、計測パッチの基準追従）: fork ブランチの 4 コミットを上流 main `4e58c721c8…` へリベースし、PR head を `eeac6734cd…` → `0bbdee3787…` に更新しました。`patches/decode-hook.patch` を新基準の差分どおりに再生成し、v0.22.4 タグへ同じ 4 コミットを 3-way マージで再生して `patches/decode-hook-v0.22.4.patch` を新設しました（旧 v0.22.2 基準のパッチは retired）。どちらの基準でも `git apply --check` が通り、適用後の計測テストは両ツリーとも `26 passed`・エラー0 でした。計測内容そのものは変更していません（差分は基準コミットと適用先だけ）。
 
 実機 E2E（2026-10-16、3 回のプロブで順次確認。ローカル LLM は llama-swap 経由の llama.cpp 系エンジン）:
 
@@ -139,7 +139,17 @@ Desktop の短いチャット 5 件（ストリーミング、`finish_reason = s
 - 未計測の呼び出し（非ストリーミング・中断・計測前の本体プロセス）は `measured = false` となり、表示へ数値を出しません（初回表示は `—`）。
 - 表示の作り方は検証後に 1 回変わりました（公式項目と同じ ⚡/`… t/s` 表記・未計測 `⚡ —`・ホバー文言を「フォーカス中のセッションの直近10回のデコード速度」へ簡素化・右クリック メニューで切り替え可能な登録方式）。旧作り（`↑ … tok/s` 表記・括弧付き文言）と新作りのアイコン・表記・文言・メニュー切替の両方を実機目視済みです。
 
-既知の制限: v0.22.2 のリリース ツリーでは上の import 時不具合により chat 系 pytest の収集・実行ができないため、chat 側の計測テストは PR 基準コミットのツリーで実行してあります（`26 passed`）。Desktop 表示の実機検証は上記のとおり両構成で完了しています。セッション単位は本体側との契約を変えないプラグイン内完結の変更で、上の自動テストで確定しています。
+クラウド LLM の実測（2026-10-22、認証済みの実接続で 1 呼び出しずつ）:
+
+計測パッチを適用した本体（main `4e58c721c8…` 基準）で `post_api_request` フックが受け取った payload を直接観測しました。フックに一時的な診断処理を加えて provider・api_mode・usage の出力トークン数・decode_seconds・finish_reason・API 所要時間を記録しました（認証情報・応答本文・接続 URL・セッション ID は記録していません）。
+
+- ローカル LLM（`custom` / `chat_completions`）: 出力トークン 24、decode_seconds 0.19（API 所要時間 9.57 秒）。表示側で計算すると約 126 t/s で、2026-10-10 に記録したローカルの実測速度と一致します。
+- Ollama Cloud（`ollama-cloud` / `chat_completions`）: 出力トークン 185、decode_seconds 1.53（API 所要時間 5.46 秒）、終端は `stop`。ストリームの終端フレームで usage が取れ、正の decode_seconds が記録されました。
+- Codex サブスクリプション（`openai-codex` / `codex_responses`）: 3 呼び出しとも出力トークンと decode_seconds が取れました（97 / 145 / 6 トークン、0.46 / 1.15 / 0.39 秒、終端は 2 件が `tool_calls`、1 件が `stop`）。実際に使われた経路は `codex_responses` で、`codex_app_server` ではありません（`model.openai_runtime` の指定が無く、Codex の OAuth 認証は app-server 利用の証拠にはなりません）。
+
+3 つとも計測の窓（最初の実データ delta から終端フレームまで）が取れ、usage の出力トークンが正規化されて配信されています。表示側はプロバイダで絞り込まないので、この 2 つのクラウド経路にも同じ値が流れます。
+
+既知の制限: v0.22.2 のリリース ツリーで chat 系 pytest の収集・実行を妨げていた import 時不具合は v0.22.4 では解消しています（v0.22.4 基準のパッチ適用ツリーで `26 passed`）。Desktop 表示の実機検証は上記のとおり両構成で完了しています。セッション単位は本体側との契約を変えないプラグイン内完結の変更で、上の自動テストで確定しています。
 
 Hermes 公式の検証ゲート: `hermes plugins doctor <plugin dir> --ci` と `hermes plugins validate <plugin dir>`（manifest・hook 登録・Desktop 半分を含む）を通しています。
 
@@ -152,4 +162,4 @@ Hermes 公式の検証ゲート: `hermes plugins doctor <plugin dir> --ci` と `
 
 ## ライセンス
 
-MIT（`LICENSE`）。`patches/decode-hook.patch` と `patches/decode-hook-v0.22.2.patch` は上流 Hermes（NousResearch/hermes-agent）の該当コミット（それぞれ上流 main の固定コミット、v0.22.2 タグコミット）を基準にした差分で、上流派生コードを含みます。その著作権表示を `THIRD_PARTY_NOTICES.md` に記載します（本体パッチを当リポジトリで再配布する限り取り除かない）。
+MIT（`LICENSE`）。`patches/decode-hook.patch` と `patches/decode-hook-v0.22.4.patch` は上流 Hermes（NousResearch/hermes-agent）の該当コミット（それぞれ上流 main の固定コミット、v0.22.4 タグコミット）を基準にした差分で、上流派生コードを含みます。その著作権表示を `THIRD_PARTY_NOTICES.md` に記載します（本体パッチを当リポジトリで再配布する限り取り除かない）。
