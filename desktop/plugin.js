@@ -2,8 +2,17 @@ import { STATUSBAR_AREAS, Tip, atom, computed, host, icons, useValue } from '@he
 import { jsx } from 'react/jsx-runtime'
 
 const ID = 'hermes-decode'
-// ホバー説明: 直近10回のデコード速度だとだけ書く（履歴値である説明は泡では繰り返さない）。
-const DESCRIPTION = 'フォーカス中のセッションの直近10回のデコード速度'
+// CONTRACT-BEGIN (tests/desktop-match.test.mjs extracts this block verbatim, injects it
+// into the extracted matcher/cache blocks, and asserts these numbers still equal
+// WINDOW_SIZE / MAX_DECODE_WINDOWS / SCHEMA_VERSION in __init__.py — the two halves
+// cannot import each other, so this shared declaration is the drift guard)
+const WINDOW_SIZE = 10
+const MAX_ROWS = 8
+const SCHEMA_VERSION = 1
+// CONTRACT-END
+// Hover tip: says only that the readout is the focused session's last WINDOW_SIZE decode
+// speeds — the history explanation is not repeated in the tooltip.
+const DESCRIPTION = `フォーカス中のセッションの直近${WINDOW_SIZE}回のデコード速度`
 const latestSamples = atom([])
 // Samples arrive per (session, endpoint), newest-first, and the python window is
 // keyed the same way: another session never borrows a measurement, and one
@@ -52,11 +61,11 @@ export function applyIncomingSample(rows, key, sample, model) {
   // replay their speed after the endpoint moved. The next measured call
   // rebuilds a row; another session's rows are never touched.
   const staleConn = item => !sample && item && item.sessionId === key.sessionId && item.conn !== key.conn
-  // The row list stays bounded like the python window LRU: eight windows, no more.
+  // The row list stays bounded like the python window LRU: MAX_ROWS windows, no more.
   return [
     ...(sample ? [sample] : []),
     ...rows.filter(item => !sameKey(item) && !staleModel(item) && !staleGeneration(item) && !staleConn(item))
-  ].slice(0, 8)
+  ].slice(0, MAX_ROWS)
 }
 // CACHE-END
 // The SDK does not expose the focused session's own model, and borrowing the
@@ -98,11 +107,12 @@ function parseSample(event) {
   // older-generation rows so the readout is not stuck on a pre-restart endpoint.
   const gen = typeof payload.gen === 'string' && payload.gen ? payload.gen : null
 
-  if (version !== 1 || typeof sessionId !== 'string' || !sessionId || typeof provider !== 'string' || !provider || typeof model !== 'string' || !model) return null
+  if (version !== SCHEMA_VERSION || typeof sessionId !== 'string' || !sessionId || typeof provider !== 'string' || !provider || typeof model !== 'string' || !model) return null
   // The window is per (session, endpoint): one row per live window, newest wins.
   const key = { sessionId, conn, gen }
   if (!payload.measured) {
-    // 未計測の呼び出しが窓を空にした: 表示値を残さず未計測へ戻す。
+    // An unmeasured call empties that window: drop the readout instead of keeping
+    // a number the current call did not measure.
     return { key, sample: null, model }
   }
   const speed = payload.tok_per_sec

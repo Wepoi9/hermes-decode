@@ -1,7 +1,9 @@
 // Dependency-free test of the status-bar matcher: the repo ships desktop/
 // plugin.js as a SINGLE plain-ESM file the desktop reads verbatim, so this
-// test extracts the MATCHER block from the same file the app loads instead
-// of importing the plugin (its `@hermes/plugin-sdk` import is app-owned).
+// test extracts the CONTRACT, MATCHER and CACHE blocks from the same file the
+// app loads instead of importing the plugin (its `@hermes/plugin-sdk` import is
+// app-owned). It also checks the caps the two halves declare separately still
+// agree with `__init__.py`.
 import { readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -14,13 +16,35 @@ const source = await readFile(
 const block = source.match(/\/\/ MATCHER-BEGIN[^\n]*\n([\s\S]*?)\n\/\/ MATCHER-END/)
 assert.ok(block, 'plugin.js must contain the MATCHER-BEGIN..MATCHER-END block')
 const code = block[1].replace(/export function/, 'function')
-const pickVisibleSample = new Function(`${code}; return pickVisibleSample`)()
+// The shared caps live in the CONTRACT block the extracted functions read from.
+const contractBlock = source.match(/\/\/ CONTRACT-BEGIN[^\n]*\n([\s\S]*?)\n\/\/ CONTRACT-END/)
+assert.ok(contractBlock, 'plugin.js must contain the CONTRACT-BEGIN..CONTRACT-END block')
+const contract = contractBlock[1]
+const pickVisibleSample = new Function(`${contract}; ${code}; return pickVisibleSample`)()
 assert.equal(typeof pickVisibleSample, 'function')
 const cacheBlock = source.match(/\/\/ CACHE-BEGIN[^\n]*\n([\s\S]*?)\n\/\/ CACHE-END/)
 assert.ok(cacheBlock, 'plugin.js must contain the CACHE-BEGIN..CACHE-END block')
 const cacheCode = cacheBlock[1].replace(/export function/, 'function')
-const applyIncomingSample = new Function(`${cacheCode}; return applyIncomingSample`)()
+const applyIncomingSample = new Function(`${contract}; ${cacheCode}; return applyIncomingSample`)()
 assert.equal(typeof applyIncomingSample, 'function')
+
+// The two halves cannot import each other, so the caps are declared twice; this is the
+// drift guard: the Desktop half must still answer to the Python half's numbers.
+const pythonSource = await readFile(
+  join(dirname(fileURLToPath(import.meta.url)), '..', '__init__.py'),
+  'utf8'
+)
+const declared = (source_, label, pattern) => {
+  const found = new RegExp(pattern, 'm').exec(source_)
+  assert.ok(found, `${label} must be declared`)
+  return Number(found[1])
+}
+assert.equal(declared(contract, 'desktop WINDOW_SIZE', '^const WINDOW_SIZE = (\\d+)'),
+             declared(pythonSource, 'python WINDOW_SIZE', '^WINDOW_SIZE = (\\d+)'))
+assert.equal(declared(contract, 'desktop MAX_ROWS', '^const MAX_ROWS = (\\d+)'),
+             declared(pythonSource, 'python MAX_DECODE_WINDOWS', '^MAX_DECODE_WINDOWS = (\\d+)'))
+assert.equal(declared(contract, 'desktop SCHEMA_VERSION', '^const SCHEMA_VERSION = (\\d+)'),
+             declared(pythonSource, 'python SCHEMA_VERSION', '^SCHEMA_VERSION = (\\d+)'))
 
 // The handler stores samples newest-first. Samples carry (sessionId, conn).
 const newer = { sessionId: 's-focused', provider: 'p1', model: 'm', conn: 'c-a', tokPerSecond: 120 }

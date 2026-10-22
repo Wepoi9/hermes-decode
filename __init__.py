@@ -9,10 +9,13 @@ import os
 import threading
 
 PLUGIN_ID = "hermes-decode"
-WINDOW_SIZE = 10
-MAX_DECODE_WINDOWS = 8
-SCHEMA_VERSION = 1
-CONNAUTH_ID_LENGTH = 12
+# These caps and the payload keys are the contract with the Desktop half, which
+# repeats them (desktop/plugin.js) because the two halves cannot import each
+# other: tests/desktop-match.test.mjs asserts the numbers still match this file.
+WINDOW_SIZE = 10          # completed calls kept per (session, endpoint) window
+MAX_DECODE_WINDOWS = 8    # windows retained at once (LRU), mirrored by the row cap
+SCHEMA_VERSION = 1        # payload contract version the Desktop half checks
+CONN_ID_LENGTH = 12
 # Random once per process (and once per plugin reload, which re-imports this
 # module): the connection identity is keyed by it, so no external observer can
 # match a candidate URL against a published digest — the identity lives only in
@@ -25,7 +28,7 @@ _CONNECTION_KEY = os.urandom(32)
 # retire a session's pre-restart rows when it sees the next generation arrive,
 # instead of keeping a stale endpoint alive and showing '—' forever.
 PROCESS_GENERATION_LENGTH = 12
-_PROCESS_GENERATION = hashlib.sha1(_CONNECTION_KEY).hexdigest()[:PROCESS_GENERATION_LENGTH]
+_PROCESS_GENERATION = hashlib.sha256(_CONNECTION_KEY).hexdigest()[:PROCESS_GENERATION_LENGTH]
 
 
 def _positive_finite(value):
@@ -63,8 +66,8 @@ def _conn_id(base_url):
     if not normalized:
         return None
     return hmac.new(
-        _CONNECTION_KEY, normalized.casefold().encode("utf-8"), hashlib.sha1
-    ).hexdigest()[:CONNAUTH_ID_LENGTH]
+        _CONNECTION_KEY, normalized.casefold().encode("utf-8"), hashlib.sha256
+    ).hexdigest()[:CONN_ID_LENGTH]
 
 
 class DecodeAggregator:

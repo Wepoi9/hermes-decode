@@ -101,7 +101,7 @@ def test_conn_identity_is_derived_and_opaque():
     assert derived == plugin._conn_id("https://private.invalid/")
     assert derived == plugin._conn_id("https://private.invalid ")
     assert derived != plugin._conn_id("https://other.invalid")
-    assert len(derived) == plugin.CONNAUTH_ID_LENGTH
+    assert len(derived) == plugin.CONN_ID_LENGTH
     # The URL itself never leaks into the derived identity.
     assert "private" not in derived and "invalid" not in derived
     assert plugin._conn_id(None) is None
@@ -188,10 +188,10 @@ def test_windows_are_bounded_to_eight_session_endpoint_pairs():
     assert state.retained_window_count == 8
     assert state.history_for("s-0", None) == ()
     assert len(state.history_for("s-8", None)) == 1
-    # The model bookkeeping is bounded the same way, and an evicted session
-    # loses its windows: nothing accumulates without a ceiling.
-    assert len(state._models) == 8
-    assert "s-0" not in state._models
+    # The evicted session holds nothing — not a window and not a remembered model:
+    # its next call starts a fresh window instead of resuming the evicted one.
+    assert state.record("s-0", "m", None, {"output_tokens": 10}, 1)["valid_samples"] == 1
+    assert state.retained_window_count == 8
 
 
 def test_register_installs_only_post_api_request_hook():
@@ -210,18 +210,27 @@ def test_concurrent_model_calls_keep_windows_consistent():
     state = plugin.DecodeAggregator()
     keys = [(f"s-{index}", f"c-{index}") for index in range(6)]
     calls_per_key = 20
+    # A worker thread's failure is invisible to pytest, so workers report to the
+    # parent instead of asserting on their own stack.
+    failures = []
 
     def hammer(index):
         session, conn = keys[index]
         barrier.wait()
-        for call_index in range(calls_per_key):
-            result = state.record(session, f"m-{index}", conn, {"output_tokens": 10}, 1)
-            assert result["valid_samples"] == min(call_index + 1, plugin.WINDOW_SIZE)
+        try:
+            for call_index in range(calls_per_key):
+                result = state.record(session, f"m-{index}", conn, {"output_tokens": 10}, 1)
+                assert result["valid_samples"] == min(call_index + 1, plugin.WINDOW_SIZE)
+        except Exception as error:
+            failures.append(error)
 
     def shared_hammer():
         barrier.wait()
-        for _ in range(calls_per_key):
-            state.record("shared", "m-shared", None, {"output_tokens": 10}, 1)
+        try:
+            for _ in range(calls_per_key):
+                state.record("shared", "m-shared", None, {"output_tokens": 10}, 1)
+        except Exception as error:
+            failures.append(error)
 
     barrier = threading.Barrier(len(keys) + 2)
     threads = [threading.Thread(target=hammer, args=(index,)) for index in range(len(keys))]
@@ -232,6 +241,7 @@ def test_concurrent_model_calls_keep_windows_consistent():
     for thread in threads:
         thread.join()
 
+    assert failures == [], f"concurrent record failed: {failures!r}"
     # Concurrent calls never lost an append or blurred a window: every hammered
     # window holds exactly its last ten samples, and the LRU cap stayed honest.
     assert state.retained_window_count == 7
