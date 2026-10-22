@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 import threading
 
@@ -22,12 +23,24 @@ def test_ratio_of_sums_not_mean_of_rates():
     assert result["tok_per_sec"] != (60 + 45) / 2
 
 
-def test_unmeasured_samples_stay_in_window_but_not_sum():
+def test_unmeasured_latest_call_reports_no_current_speed():
     state = plugin.DecodeAggregator()
     state.record("s", "m", None, {"output_tokens": 300}, 3)
     result = state.record("s", "m", None, None, None)
-    assert result == {"tok_per_sec": 100, "valid_samples": 1, "measured": True}
+    # The latest call measured nothing, so the readout is empty even though the
+    # window still holds the earlier measured sample.
+    assert result == {"tok_per_sec": None, "valid_samples": 1, "measured": False}
     assert len(state.history_for("s", None)) == 2
+
+
+def test_history_is_reused_at_the_next_measured_call():
+    state = plugin.DecodeAggregator()
+    state.record("s", "m", None, {"output_tokens": 300}, 3)
+    state.record("s", "m", None, None, None)
+    result = state.record("s", "m", None, {"output_tokens": 300}, 3)
+    # The unmeasured call stayed in the window, so the next measured call
+    # aggregates the history again.
+    assert result == {"tok_per_sec": 100, "valid_samples": 2, "measured": True}
 
 
 def test_eleventh_call_evicts_oldest_sample():
@@ -94,31 +107,30 @@ def test_another_model_never_borrows_the_window(monkeypatch):
     assert [payload["valid_samples"] for payload in emitted] == [1, 1]
 
 
-def test_conn_identity_is_derived_and_opaque():
-    derived = plugin._conn_id("https://private.invalid")
-    # Same endpoint, one identity inside one process — window keys stay stable.
-    assert derived == plugin._conn_id("https://private.invalid")
-    assert derived == plugin._conn_id("https://private.invalid/")
-    assert derived == plugin._conn_id("https://private.invalid ")
-    assert derived != plugin._conn_id("https://other.invalid")
-    assert len(derived) == plugin.CONN_ID_LENGTH
-    # The URL itself never leaks into the derived identity.
-    assert "private" not in derived and "invalid" not in derived
-    assert plugin._conn_id(None) is None
-    assert plugin._conn_id("") is None
-    assert plugin._conn_id("   / ") is None
+def test_endpoint_key_is_normalized_and_stays_in_process():
+    # The endpoint key only ever indexes this process's own windows; the
+    # desktop half never sees it, so no digest is needed.
+    assert plugin._endpoint_key("https://private.invalid") == "https://private.invalid"
+    assert plugin._endpoint_key("https://private.invalid/") == "https://private.invalid"
+    assert plugin._endpoint_key(" https://Private.Invalid ") == "https://private.invalid"
+    assert plugin._endpoint_key("https://other.invalid") != plugin._endpoint_key("https://private.invalid")
+    assert plugin._endpoint_key(None) is None
+    assert plugin._endpoint_key("") is None
+    assert plugin._endpoint_key("   / ") is None
 
 
-def test_conn_identity_is_not_globally_deterministic():
-    # A salt-less deterministic digest would let anyone match candidate URLs
-    # against a published identity; the identity is keyed per process instead,
-    # so a fresh import (a plugin reload, a new process) derives its own value
-    # while staying stable for that process.
-    fresh_spec = importlib.util.spec_from_file_location("hermes_decode_conn_fresh", MODULE_PATH)
-    fresh = importlib.util.module_from_spec(fresh_spec)
-    fresh_spec.loader.exec_module(fresh)
-    assert fresh._conn_id("https://private.invalid") != plugin._conn_id("https://private.invalid")
-    assert fresh._conn_id("https://private.invalid") == fresh._conn_id("https://private.invalid ")
+def test_payload_carries_no_endpoint_or_generation_identity(monkeypatch):
+    emitted = []
+    monkeypatch.setattr(plugin, "_broadcast", lambda event, payload: emitted.append(payload))
+    plugin._AGGREGATOR = plugin.DecodeAggregator()
+    plugin.post_api_request(session_id="s", provider="p", model="m",
+                            usage={"output_tokens": 200}, decode_seconds=2,
+                            base_url="https://private.invalid")
+    payload = emitted[-1]
+    # The endpoint never reaches the desktop half: no URL, no digest of it, and
+    # no process-generation id either.
+    assert "conn" not in payload and "gen" not in payload
+    assert "private.invalid" not in json.dumps(payload)
 
 
 def test_invalid_metrics_and_usage_are_unmeasured():
@@ -149,26 +161,9 @@ def test_hook_emits_minimal_payload(monkeypatch):
                             response="private", base_url="https://private.invalid")
     event, payload = emitted[-1]
     assert event == "sample"
-    assert payload == {"schema_version": 1, "session_id": "session", "provider": "provider",
-                       "model": "model", "conn": plugin._conn_id("https://private.invalid"),
-                       "gen": plugin._PROCESS_GENERATION,
-                       "tok_per_sec": 100, "measured": True, "valid_samples": 1}
-
-
-def test_generation_id_tracks_the_process_lifecycle():
-    # A backend restart (or a plugin reload: a fresh import) regenerates the
-    # connection identity's key, so the same session would otherwise keep its
-    # pre-restart rows under a stale endpoint and show '—' forever. The payload
-    # carries one opaque generation id per process so the desktop can tell a
-    # restarted backend's samples from the previous run's and drop the stale
-    # rows: stable for the life of this process, different for the next one.
-    assert plugin._PROCESS_GENERATION == plugin._PROCESS_GENERATION
-    assert len(plugin._PROCESS_GENERATION) == plugin.PROCESS_GENERATION_LENGTH
-    fresh_spec = importlib.util.spec_from_file_location("hermes_decode_gen_fresh", MODULE_PATH)
-    fresh = importlib.util.module_from_spec(fresh_spec)
-    fresh_spec.loader.exec_module(fresh)
-    assert fresh._PROCESS_GENERATION != plugin._PROCESS_GENERATION
-    assert fresh._PROCESS_GENERATION == fresh._PROCESS_GENERATION
+    assert payload == {"schema_version": 2, "session_id": "session", "provider": "provider",
+                       "model": "model", "tok_per_sec": 100, "measured": True,
+                       "valid_samples": 1}
 
 
 def test_hook_without_identity_stays_silent(monkeypatch):
@@ -215,11 +210,11 @@ def test_concurrent_model_calls_keep_windows_consistent():
     failures = []
 
     def hammer(index):
-        session, conn = keys[index]
+        session, endpoint = keys[index]
         barrier.wait()
         try:
             for call_index in range(calls_per_key):
-                result = state.record(session, f"m-{index}", conn, {"output_tokens": 10}, 1)
+                result = state.record(session, f"m-{index}", endpoint, {"output_tokens": 10}, 1)
                 assert result["valid_samples"] == min(call_index + 1, plugin.WINDOW_SIZE)
         except Exception as error:
             failures.append(error)
@@ -245,8 +240,8 @@ def test_concurrent_model_calls_keep_windows_consistent():
     # Concurrent calls never lost an append or blurred a window: every hammered
     # window holds exactly its last ten samples, and the LRU cap stayed honest.
     assert state.retained_window_count == 7
-    for session, conn in keys:
-        window = state.history_for(session, conn)
+    for session, endpoint in keys:
+        window = state.history_for(session, endpoint)
         assert len(window) == plugin.WINDOW_SIZE
         assert all(sample is not None for sample in window)
     assert len(state.history_for("shared", None)) == plugin.WINDOW_SIZE

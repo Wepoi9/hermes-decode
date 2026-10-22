@@ -1,11 +1,8 @@
 """Hermes Decode plugin: bounded, in-memory decode throughput aggregation."""
 
 from collections import OrderedDict, deque
-import hashlib
-import hmac
 import math
 from numbers import Real
-import os
 import threading
 
 PLUGIN_ID = "hermes-decode"
@@ -14,21 +11,7 @@ PLUGIN_ID = "hermes-decode"
 # other: tests/desktop-match.test.mjs asserts the numbers still match this file.
 WINDOW_SIZE = 10          # completed calls kept per (session, endpoint) window
 MAX_DECODE_WINDOWS = 8    # windows retained at once (LRU), mirrored by the row cap
-SCHEMA_VERSION = 1        # payload contract version the Desktop half checks
-CONN_ID_LENGTH = 12
-# Random once per process (and once per plugin reload, which re-imports this
-# module): the connection identity is keyed by it, so no external observer can
-# match a candidate URL against a published digest — the identity lives only in
-# this process's memory and dies with it.
-_CONNECTION_KEY = os.urandom(32)
-# The same per-process randomness also names the process generation: a backend
-# restart (or a plugin reload) regenerates the connection identity's key, so a
-# restarted backend cannot be told apart from its own earlier run by the opaque
-# endpoint ids alone. Publishing this one short id per call lets the desktop
-# retire a session's pre-restart rows when it sees the next generation arrive,
-# instead of keeping a stale endpoint alive and showing '—' forever.
-PROCESS_GENERATION_LENGTH = 12
-_PROCESS_GENERATION = hashlib.sha256(_CONNECTION_KEY).hexdigest()[:PROCESS_GENERATION_LENGTH]
+SCHEMA_VERSION = 2        # payload contract version the Desktop half checks
 
 
 def _positive_finite(value):
@@ -48,26 +31,21 @@ def _output_tokens(usage):
     return _positive_finite(value)
 
 
-def _conn_id(base_url):
-    """Derive an opaque connection identity from the endpoint the hook carries.
+def _endpoint_key(base_url):
+    """Normalize the endpoint the hook carries into this process's window key.
 
-    The Desktop never sees the URL itself: only this short keyed digest, so
-    samples stay separable per real connection endpoint without leaking the
-    endpoint. Root URLs are normalized (trim, drop the trailing slash,
-    casefold) before the keyed hash; a missing or malformed URL carries no
-    identity and stays None. A deterministic digest would let anyone match
-    candidate URLs against a published identity, so the digest is an HMAC
-    under the process-random key: same URL means same identity inside one
-    process, and every process (reload, restart) derives its own value.
+    The key only indexes the windows inside this process: the Desktop half
+    never receives the URL, nor any digest of it, so nothing has to be hidden
+    here. Root URLs are normalized (trim, drop the trailing slash, casefold)
+    so the same endpoint always lands in the same window; a missing or
+    malformed URL carries no key and stays None.
     """
     if not isinstance(base_url, str):
         return None
     normalized = base_url.strip().rstrip("/")
     if not normalized:
         return None
-    return hmac.new(
-        _CONNECTION_KEY, normalized.casefold().encode("utf-8"), hashlib.sha256
-    ).hexdigest()[:CONN_ID_LENGTH]
+    return normalized.casefold()
 
 
 class DecodeAggregator:
@@ -77,7 +55,8 @@ class DecodeAggregator:
     never borrows a measurement, and the same session never mixes two endpoints
     into one aggregate. A model change clears that session's decode history —
     decode speed leans on model performance, so yesterday's model's numbers
-    must not answer today's model's readout.
+    must not answer today's model's readout. The endpoint key stays inside
+    this process; the Desktop half only ever sees the readout.
     """
 
     def __init__(self):
@@ -106,9 +85,9 @@ class DecodeAggregator:
         for key in [key for key in self._windows if key[0] == session]:
             del self._windows[key]
 
-    def _touch_window(self, session, conn):
+    def _touch_window(self, session, endpoint):
         # Callers must hold the lock (record is the only caller).
-        key = (session, conn)
+        key = (session, endpoint)
         window = self._windows.pop(key, None)
         if window is None:
             window = deque(maxlen=WINDOW_SIZE)
@@ -117,17 +96,23 @@ class DecodeAggregator:
             self._windows.popitem(last=False)
         return window
 
-    def record(self, session, model, conn, usage, decode_seconds):
-        """Append one completed API call; return its current aggregate."""
+    def record(self, session, model, endpoint, usage, decode_seconds):
+        """Append one completed API call; return this session's current readout.
+
+        The aggregate covers the window's measured calls, but the readout
+        belongs to the LATEST call: an unmeasured call reports no speed, and
+        the history it leaves behind answers the next measured call.
+        """
         with self._lock:
             if self._remember_model(session, model):
                 # The session switched models: its decode history resets here,
                 # so the aggregate below only ever answers the current model.
                 self._drop_session_windows(session)
-            window = self._touch_window(session, conn)
+            window = self._touch_window(session, endpoint)
             tokens = _output_tokens(usage)
             seconds = _positive_finite(decode_seconds)
-            window.append((tokens, seconds) if tokens is not None and seconds is not None else None)
+            measured = tokens is not None and seconds is not None
+            window.append((tokens, seconds) if measured else None)
 
             token_sum = 0.0
             seconds_sum = 0.0
@@ -145,12 +130,16 @@ class DecodeAggregator:
                 rate = token_sum / seconds_sum
                 if math.isfinite(rate) and rate > 0:
                     speed = int(math.floor(rate + 0.5))
-            return {"tok_per_sec": speed, "valid_samples": sample_count, "measured": speed is not None}
+            if not measured:
+                # The latest call measured nothing: no speed belongs to this
+                # readout, however many earlier calls the window still holds.
+                speed = None
+            return {"tok_per_sec": speed, "valid_samples": sample_count, "measured": measured}
 
-    def history_for(self, session, conn):
+    def history_for(self, session, endpoint):
         """Expose the bounded window for tests and diagnostic use."""
         with self._lock:
-            window = self._windows.get((session, conn))
+            window = self._windows.get((session, endpoint))
             return () if window is None else tuple(window)
 
     @property
@@ -175,22 +164,21 @@ def post_api_request(**kwargs):
     provider = kwargs.get("provider")
     model = kwargs.get("model")
     # Without this identifying tuple, we cannot safely attribute a sample or emit it.
-    # The endpoint identity is derived here, from the hook's base_url, and stays
-    # a short digest in the payload: the window is per (session, endpoint).
+    # The endpoint only keys this process's windows: it never reaches the
+    # Desktop half, so the payload carries no URL, no digest of it and no
+    # process-generation id.
     if not all(isinstance(value, str) and value for value in (session_id, provider, model)):
         return
-    conn = _conn_id(kwargs.get("base_url"))
+    endpoint = _endpoint_key(kwargs.get("base_url"))
 
     result = _AGGREGATOR.record(
-        session_id, model, conn, kwargs.get("usage"), kwargs.get("decode_seconds")
+        session_id, model, endpoint, kwargs.get("usage"), kwargs.get("decode_seconds")
     )
     payload = {
         "schema_version": SCHEMA_VERSION,
         "session_id": session_id,
         "provider": provider,
         "model": model,
-        "conn": conn,
-        "gen": _PROCESS_GENERATION,
         "tok_per_sec": result["tok_per_sec"],
         "measured": result["measured"],
         "valid_samples": result["valid_samples"],

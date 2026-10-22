@@ -1,4 +1,4 @@
-// Dependency-free test of the status-bar matcher: the repo ships desktop/
+// Dependency-free test of the status-bar readout: the repo ships desktop/
 // plugin.js as a SINGLE plain-ESM file the desktop reads verbatim, so this
 // test extracts the CONTRACT, MATCHER and CACHE blocks from the same file the
 // app loads instead of importing the plugin (its `@hermes/plugin-sdk` import is
@@ -27,6 +27,10 @@ assert.ok(cacheBlock, 'plugin.js must contain the CACHE-BEGIN..CACHE-END block')
 const cacheCode = cacheBlock[1].replace(/export function/, 'function')
 const applyIncomingSample = new Function(`${contract}; ${cacheCode}; return applyIncomingSample`)()
 assert.equal(typeof applyIncomingSample, 'function')
+const parseBlock = source.match(/\/\/ PARSE-BEGIN[^\n]*\n([\s\S]*?)\n\/\/ PARSE-END/)
+assert.ok(parseBlock, 'plugin.js must contain the PARSE-BEGIN..PARSE-END block')
+const parseSample = new Function(`${contract}; ${parseBlock[1]}; return parseSample`)()
+assert.equal(typeof parseSample, 'function')
 
 // The two halves cannot import each other, so the caps are declared twice; this is the
 // drift guard: the Desktop half must still answer to the Python half's numbers.
@@ -46,13 +50,17 @@ assert.equal(declared(contract, 'desktop MAX_ROWS', '^const MAX_ROWS = (\\d+)'),
 assert.equal(declared(contract, 'desktop SCHEMA_VERSION', '^const SCHEMA_VERSION = (\\d+)'),
              declared(pythonSource, 'python SCHEMA_VERSION', '^SCHEMA_VERSION = (\\d+)'))
 
-// The handler stores samples newest-first. Samples carry (sessionId, conn).
-const newer = { sessionId: 's-focused', provider: 'p1', model: 'm', conn: 'c-a', tokPerSecond: 120 }
-const older = { sessionId: 's-focused', provider: 'p1', model: 'm', conn: 'c-a', tokPerSecond: 80 }
-const otherSession = { sessionId: 's-other', provider: 'p1', model: 'm', conn: 'c-a', tokPerSecond: 300 }
-const otherConn = { sessionId: 's-focused', provider: 'p2', model: 'm', conn: 'c-b', tokPerSecond: 250 }
-const noConn = { sessionId: 's-focused', provider: 'p1', model: 'm', conn: null, tokPerSecond: 90 }
-const otherModel = { sessionId: 's-focused', provider: 'p1', model: 'other-model', conn: 'c-a', tokPerSecond: 400 }
+// The python half stopped publishing an endpoint identity and a process
+// generation id: the Desktop half must not read them either, or it would keep
+// waiting for a field the payload no longer carries.
+assert.ok(!source.includes('payload.conn'), 'the payload carries no endpoint identity')
+assert.ok(!source.includes('payload.gen'), 'the payload carries no process generation id')
+
+// The handler stores one row per session, newest first.
+const newer = { sessionId: 's-focused', provider: 'p1', model: 'm', tokPerSecond: 120 }
+const older = { sessionId: 's-focused', provider: 'p1', model: 'm', tokPerSecond: 80 }
+const otherSession = { sessionId: 's-other', provider: 'p1', model: 'm', tokPerSecond: 300 }
+const otherModel = { sessionId: 's-focused', provider: 'p1', model: 'other-model', tokPerSecond: 400 }
 
 // The readout follows the FOCUSED session only: the newest measurement for
 // that session is the readout (the matcher never narrows by model; see below).
@@ -65,24 +73,16 @@ assert.equal(pickVisibleSample([otherSession], 's-focused'), null)
 assert.equal(pickVisibleSample([newer, older], 's-tab-b'), null)
 assert.equal(pickVisibleSample([otherSession, newer], 's-focused'), newer)
 
-// The same session reached over two endpoints is ambiguous: show '—', never a
-// speed that belongs to a connection the user may not be using.
-assert.equal(pickVisibleSample([newer, otherConn], 's-focused'), null)
-assert.equal(pickVisibleSample([otherConn, newer, older], 's-focused'), null)
-
-// A sample the payload carries no endpoint identity for stays ambiguous when
-// it mixes with a known endpoint: mixed known/unknown never borrows the known
-// endpoint's speed. Alone, that consistent window is readable.
-assert.equal(pickVisibleSample([noConn, newer], 's-focused'), null)
-assert.equal(pickVisibleSample([noConn], 's-focused'), noConn)
+// A session that switched connection endpoint keeps ONE row: the newest
+// measurement answers the readout instead of the session becoming ambiguous.
+assert.equal(pickVisibleSample([newer], 's-focused'), newer)
 
 // The matcher never narrows by model: the host cannot resolve the focused
 // session's own model, and borrowing the main model's slug for that would
 // point a tab's readout at a model it is not running. So the newest sample of
 // the focused session wins regardless of which model recorded it — per-model
 // freshness lives in the windows (python resets the decode history on a model
-// change and a new-model sample retires that session's stale-model rows in the
-// cache), which is what keeps a stale-model speed off the readout.
+// change, so a new model's first sample carries its own history).
 assert.equal(pickVisibleSample([otherModel], 's-focused'), otherModel)
 assert.equal(pickVisibleSample([newer, otherModel], 's-focused'), newer)
 assert.equal(pickVisibleSample([otherModel, newer], 's-focused'), otherModel)
@@ -94,78 +94,70 @@ assert.equal(pickVisibleSample([], 's-focused'), null)
 assert.equal(pickVisibleSample(null, 's-focused'), null)
 assert.equal(pickVisibleSample([null, newer, older], 's-focused'), newer)
 
-// The desktop cache keeps one row per (session, endpoint) window, replacing the
-// stale aggregate for that window only.
-const oldRow = { sessionId: 's', provider: 'p1', model: 'm', conn: 'c-a', tokPerSecond: 80 }
-const newRow = { sessionId: 's', provider: 'p1', model: 'm', conn: 'c-a', tokPerSecond: 120 }
-assert.deepEqual(applyIncomingSample([oldRow], { sessionId: 's', conn: 'c-a' }, newRow, 'm'), [newRow])
+// The desktop cache keeps ONE row per session: the incoming sample replaces
+// that session's row, whichever connection endpoint recorded it.
+const oldRow = { sessionId: 's', provider: 'p1', model: 'm', tokPerSecond: 80 }
+const newRow = { sessionId: 's', provider: 'p2', model: 'm', tokPerSecond: 120 }
+assert.deepEqual(applyIncomingSample([oldRow], 's', newRow), [newRow])
 
-// A sample under a new model retires the SAME session's stale-model rows in
-// one shot — and never touches another session's rows.
-const staleRow = { sessionId: 's', provider: 'p1', model: 'old-model', conn: 'c-a', tokPerSecond: 90 }
-const otherSessionRow = { sessionId: 's-other', provider: 'p1', model: 'old-model', conn: 'c-a', tokPerSecond: 70 }
-const newModelSample = { sessionId: 's', provider: 'p1', model: 'new-model', conn: 'c-b', tokPerSecond: 110 }
-assert.deepEqual(
-  applyIncomingSample([staleRow, otherSessionRow], { sessionId: 's', conn: 'c-b' }, newModelSample, 'new-model'),
-  [newModelSample, otherSessionRow]
-)
-
-// An unmeasured call under the session's current model: its own window's row
-// goes and the stale-model rows retire with it — nothing lingers as a row.
-assert.deepEqual(
-  applyIncomingSample([staleRow, otherSessionRow], { sessionId: 's', conn: 'c-a' }, null, 'new-model'),
-  [otherSessionRow]
-)
-
-// An unmeasured call on a NEW endpoint — the endpoint moved within the same
-// process generation and model — still ends the session's freshest call with
-// no measurement: other-endpoint rows of the same session retire with it, or
-// the readout would replay a speed from the endpoint the user just left.
 // Another session's rows are never touched.
-const movedEndpointRow = { sessionId: 's', provider: 'p1', model: 'm', conn: 'c-a', tokPerSecond: 100 }
-const keptOtherSession = { sessionId: 's-keep', provider: 'p1', model: 'm', conn: 'c-a', tokPerSecond: 55 }
-const afterMove = applyIncomingSample([movedEndpointRow, keptOtherSession], { sessionId: 's', conn: 'c-y' }, null, 'm')
-assert.deepEqual(afterMove, [keptOtherSession])
-assert.equal(pickVisibleSample(afterMove, 's'), null)
+const otherSessionRow = { sessionId: 's-other', provider: 'p1', model: 'm', tokPerSecond: 70 }
+assert.deepEqual(applyIncomingSample([oldRow, otherSessionRow], 's', newRow), [newRow, otherSessionRow])
 
-// The row list is bounded to the same eight windows as the python LRU.
+// The latest call measured nothing: that session's row goes, so the readout
+// shows '—' instead of a speed the latest call did not measure. The history
+// stays in the python windows and answers the next measured call.
+assert.deepEqual(applyIncomingSample([oldRow, otherSessionRow], 's', null), [otherSessionRow])
+assert.equal(pickVisibleSample(applyIncomingSample([oldRow], 's', null), 's'), null)
+
+// The row list is bounded: at most one row per session, MAX_ROWS sessions.
 const many = Array.from({ length: 9 }, (_unused, index) => ({
-  sessionId: `s-${index}`, provider: 'p', model: 'm', conn: null, tokPerSecond: 50 + index
+  sessionId: `s-${index}`, provider: 'p', model: 'm', tokPerSecond: 50 + index
 }))
-const bounded = applyIncomingSample(many, { sessionId: 's-new', conn: null }, {
-  sessionId: 's-new', provider: 'p', model: 'm', conn: null, tokPerSecond: 111
-}, 'm')
+const bounded = applyIncomingSample(many, 's-new', {
+  sessionId: 's-new', provider: 'p', model: 'm', tokPerSecond: 111
+})
 assert.equal(bounded.length, 8)
 assert.equal(bounded[0].tokPerSecond, 111)
 assert.ok(!bounded.some(item => item.sessionId === 's-8'))
 
-// A backend restart regenerates the connection identity, so the same session
-// would otherwise keep its pre-restart rows under a stale endpoint forever.
-// A sample under the newer generation retires the SAME session's pre-restart
-// rows so the readout is not stuck on a stale endpoint; another session's rows
-// are never touched, and a same-generation row is replaced without collateral.
-const preRestartRow = { sessionId: 's', provider: 'p1', model: 'm', conn: 'c-a', gen: 'g-old', tokPerSecond: 80 }
-const otherSessionPreRow = { sessionId: 's-other', provider: 'p1', model: 'm', conn: 'c-a', gen: 'g-old', tokPerSecond: 70 }
-const postRestartSample = { sessionId: 's', provider: 'p1', model: 'm', conn: 'c-b', gen: 'g-new', tokPerSecond: 120 }
-assert.deepEqual(
-  applyIncomingSample([preRestartRow, otherSessionPreRow], { sessionId: 's', conn: 'c-b', gen: 'g-new' }, postRestartSample, 'm'),
-  [postRestartSample, otherSessionPreRow]
-)
-// Even an unmeasured call under the new generation clears the stale endpoint.
-assert.deepEqual(
-  applyIncomingSample([preRestartRow], { sessionId: 's', conn: 'c-b', gen: 'g-new' }, null, 'm'),
-  []
-)
-// Same generation: the window's own row is replaced, nothing else retires.
-const sameGenRow = { sessionId: 's', provider: 'p1', model: 'm', conn: 'c-a', gen: 'g-new', tokPerSecond: 80 }
-const sameGenSample = { sessionId: 's', provider: 'p1', model: 'm', conn: 'c-a', gen: 'g-new', tokPerSecond: 120 }
-assert.deepEqual(
-  applyIncomingSample([sameGenRow], { sessionId: 's', conn: 'c-a', gen: 'g-new' }, sameGenSample, 'm'),
-  [sameGenSample]
-)
-// After the restart retires the pre-restart row, the window holds one endpoint
-// and reads its speed (it is never forced to '—' by a stale endpoint it no longer has).
-assert.equal(pickVisibleSample([postRestartSample], 's'), postRestartSample)
+// The payload decides the readout. A measured call carries a speed; an
+// unmeasured call (the latest call measured nothing) clears the session.
+const schemaVersion = declared(contract, 'desktop SCHEMA_VERSION', '^const SCHEMA_VERSION = (\\d+)')
+const measuredFrame = {
+  payload: {
+    schema_version: schemaVersion, session_id: 's', provider: 'p', model: 'm',
+    tok_per_sec: 120, measured: true, valid_samples: 3
+  }
+}
+const unmeasuredFrame = {
+  payload: {
+    schema_version: schemaVersion, session_id: 's', provider: 'p', model: 'm',
+    tok_per_sec: null, measured: false, valid_samples: 3
+  }
+}
+assert.deepEqual(parseSample(measuredFrame), {
+  sessionId: 's',
+  sample: { sessionId: 's', provider: 'p', model: 'm', tokPerSecond: 120 }
+})
+assert.deepEqual(parseSample(unmeasuredFrame), { sessionId: 's', sample: null })
+
+// A frame from another contract version is ignored: old and new events never mix.
+assert.equal(parseSample({ payload: { ...unmeasuredFrame.payload, schema_version: schemaVersion - 1 } }), null)
+// A measured frame without a usable speed or sample count is ignored too.
+assert.equal(parseSample({ payload: { ...measuredFrame.payload, tok_per_sec: 0 } }), null)
+assert.equal(parseSample({ payload: { ...measuredFrame.payload, tok_per_sec: Number.NaN } }), null)
+assert.equal(parseSample({ payload: { ...measuredFrame.payload, valid_samples: 0 } }), null)
+assert.equal(parseSample(null), null)
+assert.equal(parseSample({}), null)
+
+// End to end: the unmeasured call clears that session's readout, and the
+// history it left behind answers the next measured call.
+const cleared = applyIncomingSample([newRow], parseSample(unmeasuredFrame).sessionId, parseSample(unmeasuredFrame).sample)
+assert.deepEqual(cleared, [])
+assert.equal(pickVisibleSample(cleared, 's'), null)
+const restored = applyIncomingSample(cleared, parseSample(measuredFrame).sessionId, parseSample(measuredFrame).sample)
+assert.equal(pickVisibleSample(restored, 's').tokPerSecond, 120)
 
 // The bar item registers as a toggleable DATA contribution: `data` IS the
 // bar's own StatusbarItem (its id, the menu name, and the render live inside

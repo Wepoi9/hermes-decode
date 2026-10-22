@@ -8,64 +8,31 @@ const ID = 'hermes-decode'
 // cannot import each other, so this shared declaration is the drift guard)
 const WINDOW_SIZE = 10
 const MAX_ROWS = 8
-const SCHEMA_VERSION = 1
+const SCHEMA_VERSION = 2
 // CONTRACT-END
 // Hover tip: says only that the readout is the focused session's last WINDOW_SIZE decode
 // speeds — the history explanation is not repeated in the tooltip.
 const DESCRIPTION = `フォーカス中のセッションの直近${WINDOW_SIZE}回のデコード速度`
 const latestSamples = atom([])
-// Samples arrive per (session, endpoint), newest-first, and the python window is
-// keyed the same way: another session never borrows a measurement, and one
-// session never mixes two connection endpoints into one aggregate. The readout
-// follows the FOCUSED stored session — switching sessions switches the
-// reference, a fresh session shows '—' until its first completed call. The SDK
-// does not hand a plugin the focused session's own model, so the readout never
-// narrows by model: the newest measurement of the focused session wins, and
-// per-model freshness stays in the windows — a model change clears that
-// session's decode history on the python side, and a sample under the new
-// model retires that session's stale model rows from the desktop cache in the
-// same update. conn is an opaque endpoint identity (never a URL): samples whose
-// endpoints cannot be told apart show '—' instead of a wrong speed. A backend
-// restart regenerates that identity, so every sample also carries a process
-// generation id and a sample under the newer generation retires the same
-// session's pre-restart rows before the readout looks at them.
+// One row per session, newest first. The python half keeps the per-endpoint
+// windows and reports the readout of the call that just finished, so the
+// desktop half only has to remember the newest result of each session: the
+// focused session's newest row is the readout, another session's rows are
+// never shown, and a session that switches connection endpoint simply
+// replaces its own row instead of becoming ambiguous.
 // MATCHER-BEGIN (tests/desktop-match.test.mjs extracts this block verbatim)
 export function pickVisibleSample(samples, sessionId) {
   if (!Array.isArray(samples) || typeof sessionId !== 'string' || !sessionId) return null
-  const matches = samples.filter(item => item && item.sessionId === sessionId)
-  if (!matches.length) return null
-  // One endpoint for these samples: the newest measurement is the readout.
-  // Mixed endpoints (or a sample the payload carries no endpoint identity for)
-  // stay ambiguous: show '—', never a speed from a connection the user may not be using.
-  const endpoints = new Set(matches.map(item => (typeof item.conn === 'string' && item.conn) || ''))
-  return endpoints.size === 1 ? matches[0] : null
+  return samples.find(item => item && item.sessionId === sessionId) || null
 }
 // MATCHER-END
 // CACHE-BEGIN (tests/desktop-match.test.mjs extracts this block verbatim)
-export function applyIncomingSample(rows, key, sample, model) {
-  // One row per (session, endpoint) window: the incoming sample replaces its row.
-  const sameKey = item => item && item.sessionId === key.sessionId && item.conn === key.conn
-  // A sample under a new model retires the SAME session's stale-model rows in
-  // the same shot — the python window resets on a model change and the desktop
-  // cache follows it; another session's rows are never touched.
-  const staleModel = item => Boolean(model) && item && item.sessionId === key.sessionId && item.model !== model
-  // A backend restart regenerates the connection identity, so the same session
-  // would otherwise keep its pre-restart rows under a stale endpoint forever
-  // and the readout would stay '—'. A sample under a newer generation retires
-  // the SAME session's older-generation rows in the same shot; another
-  // session's rows are never touched, and a known-generation row is kept.
-  const staleGeneration = item => Boolean(key && key.gen) && item && item.sessionId === key.sessionId && item.gen !== key.gen
-  // An unmeasured call ends the session's freshest call with no measurement.
-  // The endpoint may have moved under the same generation and model: rows on
-  // OTHER endpoints of the same session retire with it, or the readout would
-  // replay their speed after the endpoint moved. The next measured call
-  // rebuilds a row; another session's rows are never touched.
-  const staleConn = item => !sample && item && item.sessionId === key.sessionId && item.conn !== key.conn
-  // The row list stays bounded like the python window LRU: MAX_ROWS windows, no more.
-  return [
-    ...(sample ? [sample] : []),
-    ...rows.filter(item => !sameKey(item) && !staleModel(item) && !staleGeneration(item) && !staleConn(item))
-  ].slice(0, MAX_ROWS)
+export function applyIncomingSample(rows, sessionId, sample) {
+  // One row per session: the incoming sample replaces that session's row.
+  // An unmeasured call (sample === null) drops the row, so the readout shows
+  // '—' instead of a speed the latest call did not measure.
+  const others = rows.filter(item => !item || item.sessionId !== sessionId)
+  return [...(sample ? [sample] : []), ...others].slice(0, MAX_ROWS)
 }
 // CACHE-END
 // The SDK does not expose the focused session's own model, and borrowing the
@@ -94,6 +61,7 @@ function DecodeSpeed() {
   })
 }
 
+// PARSE-BEGIN (tests/desktop-match.test.mjs extracts this block verbatim)
 function parseSample(event) {
   if (!event || typeof event !== 'object' || !event.payload || typeof event.payload !== 'object') return null
   const payload = event.payload
@@ -101,27 +69,20 @@ function parseSample(event) {
   const provider = payload.provider
   const model = payload.model
   const version = payload.schema_version
-  const conn = typeof payload.conn === 'string' && payload.conn ? payload.conn : null
-  // The process generation names the backend process that produced this sample.
-  // A restart regenerates it; a newer generation retires the same session's
-  // older-generation rows so the readout is not stuck on a pre-restart endpoint.
-  const gen = typeof payload.gen === 'string' && payload.gen ? payload.gen : null
 
   if (version !== SCHEMA_VERSION || typeof sessionId !== 'string' || !sessionId || typeof provider !== 'string' || !provider || typeof model !== 'string' || !model) return null
-  // The window is per (session, endpoint): one row per live window, newest wins.
-  const key = { sessionId, conn, gen }
   if (!payload.measured) {
-    // An unmeasured call empties that window: drop the readout instead of keeping
-    // a number the current call did not measure.
-    return { key, sample: null, model }
+    // The latest call was not measured: clear that session's readout.
+    return { sessionId, sample: null }
   }
   const speed = payload.tok_per_sec
   const sampleCount = payload.valid_samples
   if (!Number.isInteger(sampleCount) || sampleCount <= 0) return null
   if (typeof speed !== 'number' || !Number.isFinite(speed) || speed <= 0) return null
 
-  return { key, sample: { sessionId, provider, model, conn, gen, tokPerSecond: speed }, model }
+  return { sessionId, sample: { sessionId, provider, model, tokPerSecond: speed } }
 }
+// PARSE-END
 
 export default {
   id: ID,
@@ -152,10 +113,7 @@ export default {
     host.onEvent('plugin.hermes-decode.sample', event => {
       const parsed = parseSample(event)
       if (!parsed) return
-      const { key, sample, model } = parsed
-      // One row per (session, endpoint) window; a sample under a new model
-      // retires that session's stale-model rows in the same update.
-      latestSamples.set(applyIncomingSample(latestSamples.get(), key, sample, model))
+      latestSamples.set(applyIncomingSample(latestSamples.get(), parsed.sessionId, parsed.sample))
     })
   }
 }
