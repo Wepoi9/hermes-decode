@@ -144,10 +144,10 @@ Desktop の短いチャット 5 件（ストリーミング、`finish_reason = s
 計測パッチを適用した本体（main `4e58c721c8…` 基準）で `post_api_request` フックが受け取った payload を直接観測しました。フックに一時的な診断処理を加えて provider・api_mode・usage の出力トークン数・decode_seconds・finish_reason・API 所要時間を記録しました（認証情報・応答本文・接続 URL・セッション ID は記録していません）。
 
 - ローカル LLM（`custom` / `chat_completions`）: 出力トークン 24、decode_seconds 0.19（API 所要時間 9.57 秒）。表示側で計算すると約 126 t/s で、2026-10-10 に記録したローカルの実測速度と一致します。
-- Ollama Cloud（`ollama-cloud` / `chat_completions`）: 出力トークン 185、decode_seconds 1.53（API 所要時間 5.46 秒）、終端は `stop`。ストリームの終端フレームで usage が取れ、正の decode_seconds が記録されました。
-- Codex サブスクリプション（`openai-codex` / `codex_responses`）: 3 呼び出しとも出力トークンと decode_seconds が取れました（97 / 145 / 6 トークン、0.46 / 1.15 / 0.39 秒、終端は 2 件が `tool_calls`、1 件が `stop`）。実際に使われた経路は `codex_responses` で、`codex_app_server` ではありません（`model.openai_runtime` の指定が無く、Codex の OAuth 認証は app-server 利用の証拠にはなりません）。
+- Ollama Cloud（`ollama-cloud` / `chat_completions`）: 出力トークン 108、decode_seconds 0.89（API 所要時間 12.78 秒）、終端は `stop`。ストリームの終端フレームで usage が取れ、正の decode_seconds が記録されました。
+- Codex サブスクリプション（`openai-codex` / `codex_responses`）: 3 呼び出しとも出力トークンと decode_seconds が取れました（95 / 128 / 5 トークン、0.45 / 1.37 / 0.26 秒、終端は 2 件が `tool_calls`、1 件が `stop`）。実際に使われた経路は `codex_responses` で、`codex_app_server` ではありません（`model.openai_runtime` の指定が無く、Codex の OAuth 認証は app-server 利用の証拠にはなりません）。
 
-3 つとも計測の窓（最初の実データ delta から終端フレームまで）が取れ、usage の出力トークンが正規化されて配信されています。表示側はプロバイダで絞り込まないので、この 2 つのクラウド経路にも同じ値が流れます。
+3 つとも計測の窓（最初の実データ delta から終端フレームまで）が取れ、usage の出力トークンが正規化されて配信されています。サンプルの配信先接続クライアントは 2 件で、Desktop を含むクライアントが受信側です。表示側はプロバイダで絞り込まないので、この 2 つのクラウド経路にも同じ値が流れます。
 
 既知の制限: v0.22.2 のリリース ツリーで chat 系 pytest の収集・実行を妨げていた import 時不具合は v0.22.4 では解消しています（v0.22.4 基準のパッチ適用ツリーで `26 passed`）。Desktop 表示の実機検証は上記のとおり両構成で完了しています。セッション単位は本体側との契約を変えないプラグイン内完結の変更で、上の自動テストで確定しています。
 
