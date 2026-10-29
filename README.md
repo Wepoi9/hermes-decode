@@ -34,7 +34,7 @@ docs/VERIFICATION.md        # 実機 E2E・クラウド実測・パッチ基準�
 ## 動作条件
 
 - **ストリーミング応答のみ計測対象です。** 非ストリーミング応答、置き換えられたストリーム、失敗した呼び出し、部分応答は未計測になります。フックが発行される未計測の呼び出しは窓の 1 枠を占めますが合計へ混ざらず、フック自体が発行されないケース（中断されたターンなど）は窓に入りません。
-- Hermes 本体が `post_api_request` フックへ `decode_seconds`（有限な正の float、または `None`）を渡します。**上流がまだ計測に対応していない間、このリポジトリだけを入れても数値は出ません。** 上流 main の先端（基準コミット `0431192d69…`、v0.22.5+canary 系）でも `post_api_request` へ `decode_seconds` は渡されず、`agent/turn_response_intake.py` は `first_chunk_at` だけを渡します。本体パッチ（上流 main 基準）を適用しないと速度は出ません。本体パッチを適用するか、対応する上流 PR がマージされたリリースを利用してください。切り替え後は本体ビルドインプラグインを有効化するだけで、本体パッチと上流の旧実装を削除できます。
+- Hermes 本体が `post_api_request` フックへ `decode_seconds`（有限な正の float、または `None`）を渡します。**上流がまだ計測に対応していない間、このリポジトリだけを入れても数値は出ません。** 上流 main の先端（基準コミット `145f26b5a5…`、v0.22.5+canary 系）でも `post_api_request` へ `decode_seconds` は渡されず、`agent/turn_response_intake.py` は `first_chunk_at` だけを渡します（基準ツリーを `decode_seconds` / `_last_api_decode_seconds` で走査して 0 件であることを確認済み）。本体パッチ（上流 main 基準）を適用しないと速度は出ません。本体パッチを適用するか、対応する上流 PR がマージされたリリースを利用してください。切り替え後は本体ビルドインプラグインを有効化するだけで、本体パッチと上流の旧実装を削除できます。
 
 ## 本体パッチ（1 本の差分・基準は上流 main）
 
@@ -42,7 +42,8 @@ docs/VERIFICATION.md        # 実機 E2E・クラウド実測・パッチ基準�
 
 パッチは `patches/decode-hook.patch` の 1 本だけです。git の差分は適用先のコミットを含まないので、基準は次のコミットで指定します（この基準は CI と本節が保持する固定値です）。公開 CI は毎 push でこの基準へ `git apply --check` と適用後の計測テストを実行するので、基準がずれたら CI が止まります。
 
-- 上流 main 基準: 基準コミット `0431192d69d4afd2443a7da15bb9e129a424414c`。実機のローカルインストール（`main` を追う更新経路）が追っている先端です。
+- 上流 main 基準: 基準コミット `145f26b5a5198f5a733641ef6b6c3d74f087269d`（2026-10-29 に上流 main の先端として固定。`git describe` は `v0.22.5+canary.20261028T064834Z-471-g145f26b5a5`）。前の基準 `0431192d69d4afd2443a7da15bb9e129a424414c` から 426 コミット進んでおり、計測配線の 7 ファイルのうち内容が変わっていたのは `agent/chat_completion_helpers.py` の 1 行（Bedrock の client 生成でモデルを渡す行）だけでした。同じ差分はそのまま新基準へ適用できます（適用と計測テストの実測は `docs/VERIFICATION.md` 2026-10-29 節）。
+- 実機のローカルインストール（`main` を追う更新経路）は現時点で前の基準 `0431192d69…` にあり、計測配線は未コミットの作業ツリー変更として入っています。`hermes update` で本体が新基準以降へ進んだら、そのツリーへこの差分を再適用してください。
 
 リリースタグ基準は維持しません。v0.22.5 タグ `bf0203a794…` では `_CodexResponseAssembler` のクラス属性の並びが main と違うため、同じ差分は `agent/codex_runtime.py` で reject します（v0.22.4 タグ基準の差分は retired しました）。公表済みリリースを動かす場合は、そのツリーへ計測配線を移植してから適用してください。
 
@@ -129,7 +130,7 @@ decode 側の注記: 計測できなかった呼び出し（`decode_seconds = No
 
 本体側の計測テスト（上流 Hermes のテストスイート、パッチに含まれる）: 各呼び出しのストリーム・試行単位で計測状態が初期化され、最初の delta 受信前や待機後の tool 開始通知が計測を開始しないこと、最初の delta 以降の tool 開始通知が計測を上書きしないこと、Codex 側では生成物を伴わない announce 通知が窓を開けず、実データを伴う delta が窓を開けること、Codex 側の窓は確定したクリーンな完了終端でのみ閉じられ（failed・incomplete・部分応答は `None`）、リクエストの試行時に `_last_api_decode_seconds` がリセットされること、`decode_seconds` の公開が非ストリーミングでは `None`、`0` 以下・非有限値では `None` になること。Codex 側は決定論的な mock `time.monotonic()`（事前に用意した進行列で時計を進め、実待ちを一切挟まない。列が尽きたあとは最後の刻みを返し、テスト後の teardown で `time.monotonic()` を呼ぶ環境側の後始末を壊しません）で動き、chat 側の窓テストは chunk の間に実際の待機時間（50 ms 以上）を挟んで実際のデコード窓を作ります（Windows では直前・直後の 2 回の読みが同一 tick に潰れることがあり、応答が即座に揃うタスクでは窓が 0.0 秒＝未計測になるため）。
 
-実行結果（公開 CI、毎 push）: プラグインの pytest、Desktop の構文チェックとマッチャー・キャッシュ、上流 main 基準への適用と計測テストの 3 ジョブが揃って成功します。適用済みツリーでは `tests/agent/test_first_chunk_at_hook.py` と `tests/agent/test_codex_first_event_timing.py` が `26 passed`（クリーンな Python 3.14 環境。core の実行依存はこのバージョンのマーカーから入り、テスト道具は上流の固定版を使います。Anthropic 配列ストリームのデコード窓テスト 2 件を含み、`message_stop` まで届いた応答は計測され、EOF で切れた部分応答は `None` のままです）。実機の Windows チェックアウト（基準コミットと同じ `0431192d69…` の worktree）でも `git apply --check`・適用・`26 passed` を確認しています。
+実行結果（公開 CI、毎 push）: プラグインの pytest、Desktop の構文チェックとマッチャー・キャッシュ、上流 main 基準への適用と計測テストの 3 ジョブが揃って成功します。適用済みツリーでは `tests/agent/test_first_chunk_at_hook.py` と `tests/agent/test_codex_first_event_timing.py` が `26 passed`（クリーンな Python 3.14 環境。core の実行依存はこのバージョンのマーカーから入り、テスト道具は上流の固定版を使います。Anthropic 配列ストリームのデコード窓テスト 2 件を含み、`message_stop` まで届いた応答は計測され、EOF で切れた部分応答は `None` のままです）。新基準 `145f26b5a5…` を clone した Windows のまっさらなツリー（上流の `uv.lock` から作る test environment）でも `git apply --check`・`git apply --3way --check`・適用・`26 passed` と、`git apply --reverse` での原状回復を確認しています（`docs/VERIFICATION.md` 2026-10-29 節。基準追従のコミットを push したあと、公開 CI がこの pin で同じ 3 ジョブを再実行します）。
 
 gateway を現行コードへ再起動した後の Desktop 実機確認（2026-10-28、実機の安装包 Desktop と現行本体）: 試験用の OpenAI 互換 SSE endpoint を使い、usage を返す応答ではステータスバーが数値表示になり、同じセッションで終端フレームだけ返して usage を返さない応答では `—` へ戻ることまで、`decode_seconds` → `post_api_request` → `broadcast_plugin_event` → Desktop の DOM までを一気通貫で読んでいます。既存の設定・認証情報・セッションは変更せず、一時 `HERMES_HOME` へ実機インストールを junction でつないだ分離インスタンス（別 user-data-dir、loopback の DevTools ポート）で実施し、試験 endpoint と Debug ポートは後片付けで消しています。詳細は `docs/VERIFICATION.md`。
 

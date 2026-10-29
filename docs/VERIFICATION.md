@@ -132,3 +132,26 @@ Desktop までの伝達を、既存の環境へ触れない分離インスタン
 | 実機のインストールツリー（パッチ適用済み） | `30 failed, 80 passed, 2 skipped`（2 回実行して同じ） |
 
 パッチ適用の有無では結果は変わらず、実機のインストールツリーだけ失敗数が多くなります。失敗の理由は本体の計測とは無関係で、`agent.lsp.manager.LSPService` が実環境の実在する言語サーバーを spawn して `_broken` へ記録するものです（例: `lsp[pyright] spawn/initialize failed for a user-profile path: RuntimeError`、`assert len(svc._broken) == 0` が `1 == 0`）。まとめて流す場合の失敗は、実 `HERMES_HOME` へ file I/O するテストを弾く guard（`TEST BUG: file I/O against the REAL hermes home`）と言語サーバーの spawn 成否が主因で、同じファイルでも単独実行すれば通ります（`tests/agent/test_verification_continuation_budget.py` と `tests/agent/test_tool_batch_segmentation.py` は単独で `38 passed, 1 skipped`）。したがって本数の大きな失敗は移植由来ではなく、実機のインストールツリーと言語サーバーを伴う環境側の条件由来です。
+
+## 計測パッチの基準追従（2026-10-29、上流 main `145f26b5a5…`）
+
+前の基準 `0431192d69…` から上流 main が前進していたため、新しい先端へ基準を追従させて CI・README・`THIRD_PARTY_NOTICES.md` の pin を揃えました。実機ではなく、上流を clone したまっさらなツリーでの実測です。
+
+作業ツリー: 上流を blob 遅延 clone して main の先端（作業開始時点）`145f26b5a5198f5a733641ef6b6c3d74f087269d` を detached checkout した状態（`git describe` は `v0.22.5+canary.20261028T064834Z-471-g145f26b5a5`、前の基準から 426 コミット進、`git status` は clean）。
+
+| 確認 | 結果 |
+| --- | --- |
+| パッチが触る 7 ファイルの差分（前の基準→新基準） | `agent/chat_completion_helpers.py` だけが変更で、内容は `_bedrock_converse_call` の client 生成にアクティブなモデルを渡す 1 行。残り 6 ファイルは前の基準と同じ blob |
+| 旧パッチの適用可否（新基準） | `git apply --check` は exit 0。reject なし（計測配線の移植は不要だった） |
+| パッチ再生成 | `git diff` で再生成。7 ファイル・560 追加 / 7 削除は旧パッチと同じ形、ハンクヘッダ 32 本も一致、差分の本文の増減は 0 件。変わったのは `agent/chat_completion_helpers.py` の `index` の前置イメージだけ（`d8a4b815ae` → `c682fbd4d7`、適用後は `a23f0c48c9` → `3f73092489`） |
+| 往復の確認 | まっさらなツリーで `git apply --check`（exit 0）→ `git apply --3way --check`（exit 0）→ 適用（変更は上記 7 ファイルのみ）→ `git apply --reverse` で `git status` clean に戻る |
+| RED（パッチ無しの計測テスト 2 ファイル） | `10 passed`（上流側の既存テストだけが存在し、このツリーに `decode_seconds` の配線はない） |
+| GREEN（パッチ適用後の計測テスト 2 ファイル） | `26 passed` |
+| 既存の関連スイート（パッチ適用後） | `209 passed, 4 skipped`（失敗 0。`tests/agent` の streaming・Codex Responses adapter・run_agent codex_responses・turn response intake relay・Codex runtime live events・stream retry backoff・plugin stream hooks・usage anchor・stream single writer とその guard、`tests/e2e` の relay native OpenAI・Anthropic stream の計 12 ファイル） |
+| 上流 main がまだ計測を受け付けていないこと | 新基準のまっさらなツリーで `agent/*.py` を `decode_seconds` / `_last_api_decode_seconds` で走査して 0 件、`agent/turn_response_intake.py` は `first_chunk_at` だけを渡す |
+
+実行環境: Windows の上流 clone。test environment は上流の `uv.lock` から `uv sync --frozen --group dev --group test` で作り、Python 3.14.7・pytest 9.1.1・pytest-asyncio 1.4.0・anthropic 0.125.0 です。実行は `.venv\Scripts\python.exe -m pytest <対象ファイル> -q`（`OPENAI_API_KEY`・`OPENROUTER_API_KEY` は空、`PYTHONHASHSEED=0`）。上流の `scripts/run_tests.sh` は bash 必須で、この Windows 環境では WSL の bash が起動しないため直接 pytest を呼んでいます（上流ランナーのファイル単位隔離や環境の固定は入らない）。上流テストスイート全体をまとめて流す実行は今回行っていません（前節のとおり環境側の条件で大量の失敗が出るため、対象を絞って失敗 0 を確認しています）。
+
+プラグイン側（集計・表示・CI の他の 2 ジョブ）は無変更です。基準追従のコミットはローカルまでで、push は行っていません。公開 CI がこの pin で 3 ジョブを再実行するのは push 以降になります。
+
+実機側は前の基準のまま残っています。実機のインストール（`main` を追う更新経路）は `0431192d69…`（`v0.22.5+canary.20261028T064834Z-45-g0431192d69`）にあり、計測配線は未コミットの作業ツリー変更として 7 ファイルに入っています（`git status` は上記 7 ファイルが dirty、`decode_seconds` の走査は 16 件）。本体が新基準以降へ更新されたあとは、そのツリーへ再生成した差分を再適用する必要があります。実プロバイダ（Codex サブスクリプション・Ollama Cloud・ローカル LLM）での Desktop 表示は今回の作業でも実施していません（前節どおり未確認のままです）。

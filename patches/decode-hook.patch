@@ -12,7 +12,7 @@ index 72d96a38fd..981fb5a5d8 100644
  
  
 diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
-index d8a4b815ae..a23f0c48c9 100644
+index c682fbd4d7..3f73092489 100644
 --- a/agent/chat_completion_helpers.py
 +++ b/agent/chat_completion_helpers.py
 @@ -2713,6 +2713,9 @@ class _StreamingCall(StreamingWaitMonitor):

@@ -11,7 +11,7 @@
     Copyright (c) 2025 Nous Research
 
 - 上流リポジトリ: https://github.com/NousResearch/hermes-agent（MIT ライセンス）
-- 適用基準（上流 main）: `0431192d69d4afd2443a7da15bb9e129a424414c`（固定コミット）
+- 適用基準（上流 main）: `145f26b5a5198f5a733641ef6b6c3d74f087269d`（固定コミット）
 - 上流 PR: NousResearch/hermes-agent#139204（マージ待ち）
 
 上流の著作権表示は上流側の MIT 条件の一部であり、当リポジトリの `LICENSE`（MIT、© 2026 Wepoi9）は
