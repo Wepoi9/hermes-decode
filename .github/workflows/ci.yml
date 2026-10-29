@@ -40,9 +40,10 @@ jobs:
         run: node tests/desktop-match.test.mjs
 
   # One patch artifact (`patches/decode-hook.patch`); the base commit is the CI's
-  # choice, not part of the diff. Both jobs apply the same bytes: this job onto the
-  # upstream main base the PR branch rebases onto, the job below onto the released
-  # v0.22.4 tag commit. A split in the two would fail `git apply --check` here.
+  # choice, not part of the diff. The base is the upstream main commit the patch was
+  # ported onto (see `docs/VERIFICATION.md`); when the running Hermes checkout moves,
+  # re-port the patch and re-pin this commit together — a drifted base fails
+  # `git apply --check` here instead of silently shipping an unusable patch.
   core-patch-applies:
     name: Core patch applies to its base commit and its tests run
     runs-on: ubuntu-24.04
@@ -52,57 +53,26 @@ jobs:
         with:
           python-version: '3.14'
       - name: Clone upstream Hermes and check out the base commit
-        # The base commit is the fork PR branch's parent commit; when the PR
-        # branch rebases, keep this pin and the regenerated patch in step.
+        # The base commit is the upstream main commit the patch is regenerated
+        # against; keep this pin and the regenerated patch in step.
         run: |
           git clone --filter=blob:none --no-checkout https://github.com/NousResearch/hermes-agent.git hermes
-          git -C hermes switch --detach 4e58c721c8cf9b51c46636ea84ea6a5cb540880a
+          git -C hermes switch --detach 0431192d69d4afd2443a7da15bb9e129a424414c
       - name: Apply --check and apply the decode hook patch
         run: |
           git -C hermes apply --check "$GITHUB_WORKSPACE/patches/decode-hook.patch"
           git -C hermes apply "$GITHUB_WORKSPACE/patches/decode-hook.patch"
+      - name: Sync upstream test environment
+        # Use the upstream lock: pip rejects the Python 3.14 Pillow override.
+        run: |
+          python -m pip install --quiet uv==0.12.3
+          cd hermes
+          uv sync --frozen --group dev --group test
       - name: Run the decode measurement tests on the applied tree
-        # The patch carries both measurement files; on the main basis the chat
-        # suite (including the Anthropic decode-window cases) collects cleanly,
-        # so the applied tree must actually pass them, not just apply.
-        # Python 3.14 installs the core's marker-gated runtime dependencies
-        # from the package itself; the test toolchain mirrors upstream's own
-        # pins (pytest / pytest-asyncio / anthropic at the reviewed versions).
-        run: |
-          pip install -e ./hermes --quiet
-          pip install --quiet pytest==9.1.1 pytest-asyncio==1.3.0 anthropic==0.87.0
-          cd hermes
-          python -m pytest tests/agent/test_first_chunk_at_hook.py tests/agent/test_codex_first_event_timing.py -q
+        # Use the upstream runner to match its isolated test behavior.
+        run: scripts/run_tests.sh tests/agent/test_first_chunk_at_hook.py tests/agent/test_codex_first_event_timing.py -q --tb=short
+        working-directory: hermes
         env:
-          OPENAI_API_KEY: ""
-          OPENROUTER_API_KEY: ""
-
-  core-patch-applies-v0224:
-    name: Same patch applies to the v0.22.4 tag base and its timing tests run
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (node24)
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0 (node24)
-        with:
-          python-version: '3.14'
-      - name: Clone upstream Hermes and check out the v0.22.4 tag commit
-        run: |
-          git clone --filter=blob:none --no-checkout https://github.com/NousResearch/hermes-agent.git hermes
-          git -C hermes switch --detach 4d04303818b61bf3aa09278af48356315515965b
-      - name: Apply --check and apply the decode hook patch onto the release base
-        run: |
-          git -C hermes apply --check "$GITHUB_WORKSPACE/patches/decode-hook.patch"
-          git -C hermes apply "$GITHUB_WORKSPACE/patches/decode-hook.patch"
-      - name: Run the decode measurement tests on the applied release tree
-        # On the v0.22.4 basis both measurement files run: the release branch's
-        # chat-side import-time bug (tui_gateway/methods_onboarding.py
-        # references Path without a pathlib import) is fixed in this release,
-        # so the chat-side suite collects cleanly here as it does on main.
-        run: |
-          pip install -e ./hermes --quiet
-          pip install --quiet pytest==9.1.1 pytest-asyncio==1.3.0 anthropic==0.87.0
-          cd hermes
-          python -m pytest tests/agent/test_first_chunk_at_hook.py tests/agent/test_codex_first_event_timing.py -q
-        env:
+          HERMES_PYTHON: ${{ github.workspace }}/hermes/.venv/bin/python
           OPENAI_API_KEY: ""
           OPENROUTER_API_KEY: ""

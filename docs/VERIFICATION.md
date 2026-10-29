@@ -66,9 +66,69 @@ fork ブランチの 4 コミットを上流 main `4e58c721c8…` へリベー�
 | 条件 | 手順 | 結果 |
 | --- | --- | --- |
 | 計測済みの表示 | Codex サブスクリプション（`gpt-6.1-sol`）で実際に応答させる | 項目が `61 t/s`、次の呼び出しで `111 t/s` と更新。同画面の公式項目（同時は `15 t/s`）とは別の値で、decode 秒数による値になっている |
-| 同一セッション内の接続先切替 | 同じセッションのモデルを Codex サブスクリプション（`chatgpt.com`）からローカル Qwen（`127.0.0.1:11434`）へ切り替えて応答させる | 切替後も項目は新しい接続先の速度を表示（`106 t/s`）。旧契約なら接続先 2 つの行が競合して `—` になる箇所 |
+| 同一セッション内の接続先切替 | 同じセッションのモデルを Codex サブスクリプション（`chatgpt.com`）からローカル Qwen へ切り替えて応答させる | 切替後も項目は新しい接続先の速度を表示（`106 t/s`）。旧契約なら接続先 2 つの行が競合して `—` になる箇所 |
 | 計測済み → 未計測への遷移 | 同じセッションで、終端フレームはあるが usage を返さない応答を 1 回起こす | payload は `tok_per_sec: null` / `measured: false` / `valid_samples: 1`（窓の履歴は保持）、表示は `7 t/s` → `—` へ戻った。履歴は次の計測できた呼び出しで再利用される |
 | セッション切替 | サイドバーの別セッションへフォーカスを移す | 計測値のあるセッションではその値を表示し、値のないセッションでは `—`（他セッションの値が漏れない） |
 | バックエンド再起動 | gateway（Desktop のバックエンド）を再起動し、同じセッションで応答させる | 再起動後の最初の呼び出しは `valid_samples: 1`（新プロセスの窓）となり、表示は `—` → `8 t/s` と復帰する（stuck しない） |
 
-未計測イベントについて: 実測は、終端フレームはあるが usage を持たない応答を返す OpenAI 互換の試験エンドポイント（`127.0.0.1:18080`、作業後に停止・削除）で起こしました。Hermes 本体も Desktop も実物で、確認しているのは「最新の呼び出しが未計測なら表示は `—` に戻り、窓の履歴は保持される」という点だけです。応答が終端フレーム無しで途切れる場合は、本体が再試行して応答が返らないため `post_api_request` 自体は発行されず、表示は前の値を保ちます（README の動作条件と同じ仕様です）。
+未計測イベントについて: 実測は、終端フレームはあるが usage を持たない応答を返す OpenAI 互換の loopback 試験エンドポイント（作業後に停止・削除）で起こしました。Hermes 本体も Desktop も実物で、確認しているのは「最新の呼び出しが未計測なら表示は `—` に戻り、窓の履歴は保持される」という点だけです。応答が終端フレーム無しで途切れる場合は、本体が再試行して応答が返らないため `post_api_request` 自体は発行されず、表示は前の値を保ちます（README の動作条件と同じ仕様です）。
+
+## 計測パッチの現行 main への移植（2026-10-28、実機の Windows インストール）
+
+Desktop の速度表示が `—` になった報告の調査です。本体の計測配線が実機のツリーから失われていたことが原因でした。
+
+原因の実機確認（実機の Hermes ユーザー領域にあるインストール、`main` の先端 `0431192d69…`、`git describe` は `v0.22.5+canary.20261028T064834Z-45-g0431192d69`）:
+
+- `agent` 配下を `decode_seconds` と `_decode_first_delta_at` で走査して 0 件を確認しました。現行本体のフックは `agent/turn_response_intake.py` で `first_chunk_at` を渡しますが、`decode_seconds` は渡しません。
+- 計測配線は作業ツリーの未コミット変更として保持されていました。`hermes update` は autostash 付きの fast-forward で、2026-10-25 14:46 JST の更新ときに `stash@{0}`（`hermes-update-autostash-20261025-054619`）へ退避され、そのまま復元されていませんでした。stash の中身には `_last_api_decode_seconds` と `decode_seconds` の配線が含まれます（`git stash show -p` で確認）。
+- 旧パッチ（基準 `4e58c721c8…`）は現行 main へ `git apply --check` が通りません。reject は `agent/codex_runtime.py:862` の 1 箇所だけで、残り 6 ファイルは通ります。v0.22.5 タグ `bf0203a794…` には 7 ファイルすべてで reject します（リリースツリーの context は main と違う）。
+
+移植の内容: `agent/agent_init.py`・`agent/chat_completion_helpers.py`・`agent/turn_api_request.py`・`agent/turn_response_intake.py` と計測テスト 2 ファイルは 3-way マージでそのまま再生できました。衝突は `agent/codex_runtime.py` の 1 箇所だけで、上流が `_CodexResponseAssembler` に追加した `saw_answer_item_added` の宣言と計測刻みの宣言が同じ位置を向いたため、両方を並べて維持しました。計測の意味と配線は旧パッチのままです（差分は 7 ファイル・560 追加 / 7 削除で旧パッチと同形、`git diff --check` は clean）。
+
+テスト結果（実機の Windows。Hermes が管理する test environment の Python 3.14.7、pytest 9.1.1、pytest-asyncio 1.3.0、anthropic 0.87.0）:
+
+| 段階 | 実行 | 結果 |
+| --- | --- | --- |
+| RED | 計測テスト 2 ファイルだけを適用して実行 | `23 failed, 3 passed`（`decode_seconds` 属性と `_last_api_decode_seconds` の欠落が原因） |
+| GREEN | 本体側 5 ファイルを移植して実行 | `26 passed` |
+| 既存の関連スイート | ストリーミング・Codex Responses・intake relay・Codex live events・retry backoff・plugin stream hooks・usage anchor・stream single writer・relay native stream | `150 passed, 4 skipped` |
+| CI と同じ条件 | 基準コミット `0431192d69…` のまっさらな worktree で `git apply --check` → 適用 → 計測テスト | `--check` 成功、`26 passed` |
+
+プラグイン側は無変更です（`python -m pytest tests -q` 20 passed、`node tests/desktop-match.test.mjs` 通過、`node --check` 通過）。実機にインストール済みの Python 半分（`plugins/hermes-decode/__init__.py`・`plugin.yaml`）と Desktop 半分（`desktop-plugins/hermes-decode/plugin.js`）はリポジトリのファイルと SHA-256 が一致しており、イベント名と契約の版は現行本体と食い違っていないため、プラグイン側の修正は不要でした。
+
+CI の適用基準は 1 本化しました。v0.22.4 タグ基準のジョブを撤去し、上流 main `0431192d69d4afd2443a7da15bb9e129a424414c` の 1 基準にしています（v0.22.5 タグでは `agent/codex_runtime.py` の context が違い、同じ差分は適用できません）。
+
+この段階で未確認だった項目: gateway 再起動後の実機表示です。次節に記す通り、分離インスタンスの試験用 SSE endpoint では計測値と未計測表示を確認しました。一方、実プロバイダを用いた Chat Completions・Codex Responses の表示は未確認のままです。
+
+## gateway 再起動後の Desktop 実機確認（2026-10-28、同じインストール）
+
+Desktop までの伝達を、既存の環境へ触れない分離インスタンスで確認しました。本体は実機のもの、Desktop も実物（`apps/desktop/release/win-unpacked/Hermes.exe`）です。
+
+分離の作り方: 隔離した一時 `HERMES_HOME` へ専用の `config.yaml`（試験用 provider 1 本と `plugins.enabled: [hermes-decode]` だけ）を置き、`hermes-agent`・`installs`・`tools`・`bin` だけを junction で実機インストールへつないで、既定の user-data-dir とは別の `--user-data-dir` で Desktop を起動しました。DevTools は loopback 限定のリモートデバッグポートだけで開いています。実機の `config.yaml`・認証情報・セッションは変更していません。
+
+応答は試験用の OpenAI 互換 loopback SSE endpoint が作ります。content delta 10 かけを 0.14 秒間隔で流し、終端フレームのあとに usage（`completion_tokens: 24`）を載せる mode と、終端フレームだけ返して usage を載せない mode の 2 通りを `mode.txt` で切り替えます。
+
+| 条件 | 実機で読んだ表示 | 応答の形 |
+| --- | --- | --- |
+| usage を返す応答 | `17 t/s`（CDP で status bar の DOM を読取） | 24 tokens / 約 1.4 秒のデコード窓。プロンプト込みの API 所要時間ではなく最初の data delta から終端までの窓に対応します |
+| 同じセッションで usage を返さない応答 | `—` | 終端フレームあり・usage なし。`measured: false` のフレームでそのセッションの行が消え、直前表示の `17 t/s` が上書きされます |
+
+伝達経路は `decode_seconds`（移植した本体側の計測）→ `post_api_request` → plugin の `broadcast_plugin_event` → Desktop の `plugin.hermes-decode.sample` の順で、試験 endpoint のリクエストログ、gateway の稼働、Desktop 側 DOM の 3 点を確認しています。Desktop 半分は opt-in（`defaultEnabled: false`）なので、分離インスタンス側で有効化してから読んでいます。
+
+後片付けと本体側の再起動: 分離 Desktop とその gateway・試験 endpoint は停止し、一時 home（junction 含む）を削除しました。残存 listener が無いことを `netstat` で確認しています。実機の host gateway は `hermes gateway restart` で再起動し（作業ツリーは本体側の未コミット計測パッチを含む状態）、`hermes plugins list` の `hermes-decode` は `enabled` です。Desktop もデバッグポートなしで通常起動し直し、gateway の起動完了と既定 profile の接続まで readback しています。別 profile に残っている既存の gateway ticket 初期化警告は今回の操作とは無関係です。
+
+上流テストスイート全体をまとめて流す実行は、移植由来ではない失敗を大量に出します。実機のインストールツリーで `tests/agent` と `tests/hermes_cli/test_cli_status_bar.py` を走らせると `2046 failed, 9500 passed, 108 skipped, 415 errors`（53 分）ですが、同じ test environment のまっさらな worktree で `tests/agent/lsp` を単独実行すると、パッチ無しの基準コミットとパッチ適用済みの worktree がともに `15 failed, 95 passed, 2 skipped` で、実機のインストールツリーだけが `30 failed, 80 passed, 2 skipped` です（各 2 回実行して同じ）。差分 15 件はすべて LSP 側のテストで、実機ツリーでは `agent.lsp.manager.LSPService` が実在する言語サーバーを spawn して `_broken` へ記録します（例: `lsp[pyright] spawn/initialize failed for a user-profile path: RuntimeError`、`assert len(svc._broken) == 0` が `1 == 0`）。まとめて流す場合の主因は、実 `HERMES_HOME` へ file I/O するテストを弾く guard（`TEST BUG: file I/O against the REAL hermes home`）と言語サーバーの spawn 成否で、同じファイルでも単独実行すれば通ります（`tests/agent/test_verification_continuation_budget.py` と `tests/agent/test_tool_batch_segmentation.py` は単独で `38 passed, 1 skipped`）。パッチの有無は結果を変えないので、この本数の失敗は移植由来ではなく、実機のインストールツリーと言語サーバーを伴う環境側の条件由来です。
+
+実接続での表示（Codex サブスクリプション・Ollama Cloud・ローカル LLM）は今回の確認では実施していません。Codex Responses 経路の計測は `tests/agent/test_codex_first_event_timing.py` の決定論テストで覆っていますが、実機 Desktop での目視は未実施のままです。
+
+## 上流テストスイート全体の失敗数についての切り分け（2026-10-29、同じ test environment）
+
+移植後の実機ツリーで `tests/agent` と `tests/hermes_cli/test_cli_status_bar.py` をまとめて流すと `2046 failed, 9500 passed, 108 skipped, 415 errors`（53 分）が出ました。本体の作業ツリーが dirty なので、この本数が移植由来かどうかを基準コミット `0431192d69…` の worktree で切り分けました（同じ test environment の Python、`--tb=no` の `tests/agent/lsp` 単体実行）。
+
+| ツリー | `tests/agent/lsp` の結果 |
+| --- | --- |
+| 基準コミットのまっさらな worktree（パッチ無し） | `15 failed, 95 passed, 2 skipped`（2 回実行して同じ） |
+| 同じ worktree へ `patches/decode-hook.patch` を適用（`git apply --check` は exit 0） | `15 failed, 95 passed, 2 skipped` |
+| 実機のインストールツリー（パッチ適用済み） | `30 failed, 80 passed, 2 skipped`（2 回実行して同じ） |
+
+パッチ適用の有無では結果は変わらず、実機のインストールツリーだけ失敗数が多くなります。失敗の理由は本体の計測とは無関係で、`agent.lsp.manager.LSPService` が実環境の実在する言語サーバーを spawn して `_broken` へ記録するものです（例: `lsp[pyright] spawn/initialize failed for a user-profile path: RuntimeError`、`assert len(svc._broken) == 0` が `1 == 0`）。まとめて流す場合の失敗は、実 `HERMES_HOME` へ file I/O するテストを弾く guard（`TEST BUG: file I/O against the REAL hermes home`）と言語サーバーの spawn 成否が主因で、同じファイルでも単独実行すれば通ります（`tests/agent/test_verification_continuation_budget.py` と `tests/agent/test_tool_batch_segmentation.py` は単独で `38 passed, 1 skipped`）。したがって本数の大きな失敗は移植由来ではなく、実機のインストールツリーと言語サーバーを伴う環境側の条件由来です。

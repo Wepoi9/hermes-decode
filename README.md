@@ -13,12 +13,12 @@ Hermes Desktop のステータスバーに、現在のモデルのデコード�
 plugin.yaml                 # 本体フック post_api_request のみ宣言（ツールは登録しない）
 __init__.py                 # 集計（直近10件の窓・合算比）と Desktop へのイベント通知
 desktop/plugin.js           # Desktop 表示（STATUSBAR_AREAS.right にメニューで切り替え可能な 1 項目のみ、フォーカス中セッション追従）
-patches/decode-hook.patch   # 本体が上流で計測を受け付けるまでの一時的な計測配線（上流 main と v0.22.4 の両基準へ適用する 1 本の差分）
+patches/decode-hook.patch   # 上流 main の固定基準へ適用する一時的な計測配線
 tests/test_decode.py        # 集計の正確性と異常値・境界値・同時呼び出し・再読込の自動テスト
 tests/desktop-match.test.mjs # 表示マッチャー・キャッシュ（セッション不一致・未計測時の表示戻し）と二重宣言した上限の一致の依存なしテスト
 THIRD_PARTY_NOTICES.md      # 本体パッチが上流派生コードを含むことの明示（著作権表示）
 docs/VERIFICATION.md        # 実機 E2E・クラウド実測・パッチ基準追従の日付入り検証記録
-.github/workflows/ci.yml    # 公開 CI（プラグインテスト・Desktop 表示テスト・本体パッチを両基準へ適用して計測テスト）
+.github/workflows/ci.yml    # 公開 CI（プラグインテスト・Desktop 表示テスト・本体パッチを上流 main 基準へ適用して計測テスト）
 ```
 
 プラグイン ID とフォルダ名は `hermes-decode` です（イベント名の名前空間になるため `[a-z0-9_-]{1,64}`、ドット不可）。
@@ -34,22 +34,36 @@ docs/VERIFICATION.md        # 実機 E2E・クラウド実測・パッチ基準�
 ## 動作条件
 
 - **ストリーミング応答のみ計測対象です。** 非ストリーミング応答、置き換えられたストリーム、失敗した呼び出し、部分応答は未計測になります。フックが発行される未計測の呼び出しは窓の 1 枠を占めますが合計へ混ざらず、フック自体が発行されないケース（中断されたターンなど）は窓に入りません。
-- Hermes 本体が `post_api_request` フックへ `decode_seconds`（有限な正の float、または `None`）を渡します。**上流がまだ計測に対応していない間、このリポジトリだけを入れても数値は出ません。** 公表済みの公式 v0.22.4 でも `post_api_request` へ `decode_seconds` は無く、本体パッチ（v0.22.4 基準）を適用しないと速度は出ません。本体パッチを適用するか、対応する上流 PR がマージされたリリースを利用してください。切り替え後は本体ビルドインプラグインを有効化するだけで、本体パッチと上流の旧実装を削除できます。
+- Hermes 本体が `post_api_request` フックへ `decode_seconds`（有限な正の float、または `None`）を渡します。**上流がまだ計測に対応していない間、このリポジトリだけを入れても数値は出ません。** 上流 main の先端（基準コミット `0431192d69…`、v0.22.5+canary 系）でも `post_api_request` へ `decode_seconds` は渡されず、`agent/turn_response_intake.py` は `first_chunk_at` だけを渡します。本体パッチ（上流 main 基準）を適用しないと速度は出ません。本体パッチを適用するか、対応する上流 PR がマージされたリリースを利用してください。切り替え後は本体ビルドインプラグインを有効化するだけで、本体パッチと上流の旧実装を削除できます。
 
-## 本体パッチ（1 本の差分・二つの適用基準）
+## 本体パッチ（1 本の差分・基準は上流 main）
 
 本体側の変更は、デコード時間を計測し、既存の `post_api_request` に省略可能な `decode_seconds` として渡すことだけに限定しています。窓の管理・集計・表示・ローカライズは本体には持ち込みません。
 
-パッチは `patches/decode-hook.patch` の 1 本だけです。git の差分は適用先のコミットを含まないので、基準は次の 2 コミットで指定します（この基準は CI と本節が保持する固定値です）。上流 main と v0.22.4 タグは計測配線の 7 ファイルで同じ内容なので、同じ差分がどちらへも適用できます。公開 CI は毎 push で両基準へ `git apply --check` と適用後の計測テストを実行するので、どちらかの基準で差分がずれたら CI が止まります。
+パッチは `patches/decode-hook.patch` の 1 本だけです。git の差分は適用先のコミットを含まないので、基準は次のコミットで指定します（この基準は CI と本節が保持する固定値です）。公開 CI は毎 push でこの基準へ `git apply --check` と適用後の計測テストを実行するので、基準がずれたら CI が止まります。
 
-- 上流 main 基準: 基準コミット `4e58c721c8cf9b51c46636ea84ea6a5cb540880a`、由来（開発元 fork の PR ブランチ先端）`0bbdee3787…`。上流 PR 向けで、上流が受け付けた後の `--reverse` はこちらです。
-- 公表済み v0.22.4 基準: 基準コミット `4d04303818b61bf3aa09278af48356315515965b`（v0.22.4 タグ）。公表済み v0.22.4 を動かしている間だけ使い、上流が計測をマージしたリリースに切り替えたら不要になります。
+- 上流 main 基準: 基準コミット `0431192d69d4afd2443a7da15bb9e129a424414c`。実機のローカルインストール（`main` を追う更新経路）が追っている先端です。
+
+リリースタグ基準は維持しません。v0.22.5 タグ `bf0203a794…` では `_CodexResponseAssembler` のクラス属性の並びが main と違うため、同じ差分は `agent/codex_runtime.py` で reject します（v0.22.4 タグ基準の差分は retired しました）。公表済みリリースを動かす場合は、そのツリーへ計測配線を移植してから適用してください。
 
 ```bash
 git apply --check patches/decode-hook.patch   # 適用前チェック（実際に動かしている本体のツリーで）
 git apply patches/decode-hook.patch           # 適用
 git apply --reverse patches/decode-hook.patch # 本体が上流 PR で受け付けた後は元に戻す
 ```
+
+`hermes update` は作業ツリーの未コミット変更を autostash して fast-forward します。本体を更新すると計測配線も退避されるので、更新あとは現在のツリーへ差分を再適用します（autostash は pop しません）。次の例では `$pluginRepo` に実際のリポジトリ配置先を入力します。
+
+```powershell
+$pluginRepo = Read-Host 'Path to hermes-decode repository'
+$hermesRepo = Join-Path $env:LOCALAPPDATA 'hermes\hermes-agent'
+$patch = Join-Path $pluginRepo 'patches\decode-hook.patch'
+Select-String -Path (Join-Path $hermesRepo 'agent\*.py') -Pattern 'decode_seconds'
+git -C $hermesRepo apply --check $patch
+git -C $hermesRepo apply $patch
+```
+
+`--check` が失敗しただけでは、本体が前進したとは断定できません。まず計測配線がすでに適用済みでないか、作業ツリーに競合する変更がないかを確認してください。未適用で作業ツリーも整理済みなのに失敗する場合は、基準との差分を調べてから計測配線だけを現行コードへ移植し、基準コミットと本節・CI の pin を同時に更新してください（`docs/VERIFICATION.md` の 2026-10-28 節が移植の手順と検証結果の手本です）。
 
 ## 計測と表示の契約（イベント payload）
 
@@ -115,13 +129,15 @@ decode 側の注記: 計測できなかった呼び出し（`decode_seconds = No
 
 本体側の計測テスト（上流 Hermes のテストスイート、パッチに含まれる）: 各呼び出しのストリーム・試行単位で計測状態が初期化され、最初の delta 受信前や待機後の tool 開始通知が計測を開始しないこと、最初の delta 以降の tool 開始通知が計測を上書きしないこと、Codex 側では生成物を伴わない announce 通知が窓を開けず、実データを伴う delta が窓を開けること、Codex 側の窓は確定したクリーンな完了終端でのみ閉じられ（failed・incomplete・部分応答は `None`）、リクエストの試行時に `_last_api_decode_seconds` がリセットされること、`decode_seconds` の公開が非ストリーミングでは `None`、`0` 以下・非有限値では `None` になること。Codex 側は決定論的な mock `time.monotonic()`（事前に用意した進行列で時計を進め、実待ちを一切挟まない。列が尽きたあとは最後の刻みを返し、テスト後の teardown で `time.monotonic()` を呼ぶ環境側の後始末を壊しません）で動き、chat 側の窓テストは chunk の間に実際の待機時間（50 ms 以上）を挟んで実際のデコード窓を作ります（Windows では直前・直後の 2 回の読みが同一 tick に潰れることがあり、応答が即座に揃うタスクでは窓が 0.0 秒＝未計測になるため）。
 
-実行結果（公開 CI、毎 push）: プラグインの pytest、Desktop の構文チェックとマッチャー・キャッシュ、上流 main 基準への適用と計測テスト、v0.22.4 タグ基準へ同じパッチを適用しての計測テストの 4 ジョブが揃って成功します。両基準の適用済みツリーでは `tests/agent/test_first_chunk_at_hook.py` と `tests/agent/test_codex_first_event_timing.py` が `26 passed`（クリーンな Python 3.14 環境。core の実行依存はこのバージョンのマーカーから入り、テスト道具は上流の固定版を使います。Anthropic 配列ストリームのデコード窓テスト 2 件を含み、`message_stop` まで届いた応答は計測され、EOF で切れた部分応答は `None` のままです）。
+実行結果（公開 CI、毎 push）: プラグインの pytest、Desktop の構文チェックとマッチャー・キャッシュ、上流 main 基準への適用と計測テストの 3 ジョブが揃って成功します。適用済みツリーでは `tests/agent/test_first_chunk_at_hook.py` と `tests/agent/test_codex_first_event_timing.py` が `26 passed`（クリーンな Python 3.14 環境。core の実行依存はこのバージョンのマーカーから入り、テスト道具は上流の固定版を使います。Anthropic 配列ストリームのデコード窓テスト 2 件を含み、`message_stop` まで届いた応答は計測され、EOF で切れた部分応答は `None` のままです）。実機の Windows チェックアウト（基準コミットと同じ `0431192d69…` の worktree）でも `git apply --check`・適用・`26 passed` を確認しています。
+
+gateway を現行コードへ再起動した後の Desktop 実機確認（2026-10-28、実機の安装包 Desktop と現行本体）: 試験用の OpenAI 互換 SSE endpoint を使い、usage を返す応答ではステータスバーが数値表示になり、同じセッションで終端フレームだけ返して usage を返さない応答では `—` へ戻ることまで、`decode_seconds` → `post_api_request` → `broadcast_plugin_event` → Desktop の DOM までを一気通貫で読んでいます。既存の設定・認証情報・セッションは変更せず、一時 `HERMES_HOME` へ実機インストールを junction でつないだ分離インスタンス（別 user-data-dir、loopback の DevTools ポート）で実施し、試験 endpoint と Debug ポートは後片付けで消しています。詳細は `docs/VERIFICATION.md`。
 
 実機 E2E、クラウド LLM の実測、パッチ基準の追従記録は `docs/VERIFICATION.md` に日付入りで残しています（エンジン ログとの突き合わせ、表示の実機検証済み項目、compaction をまたぐ継続、v0.22.4 ツリーでの Windows 実チェックアウトを含む。2026-10-16 の E2E は旧契約、つまり接続先識別子とプロセス世代をイベントで送っていた実装での確認で、バックエンドを再起動したときに古い行が退避される挙動はそのときのものです。現在の契約では行は次のサンプルで置き換わります）。
 
-Hermes 公式の検証ゲート（手動での実行です。公開 CI は上記 4 ジョブを実行し、この 2 つは実行しません）: `hermes plugins doctor <plugin dir> --ci` と `hermes plugins validate <plugin dir>`（manifest・hook 登録・Desktop 半分を含む）を通しています。
+Hermes 公式の検証ゲート（手動での実行です。公開 CI は上記 3 ジョブを実行し、この 2 つは実行しません）: `hermes plugins doctor <plugin dir> --ci` と `hermes plugins validate <plugin dir>`（manifest・hook 登録・Desktop 半分を含む）を通しています。
 
-既知の制限: v0.22.2 のリリース ツリーで chat 系 pytest の収集・実行を妨げていた import 時不具合は v0.22.4 では解消しています。Desktop 表示の実機検証は 2 つの稼働形態（パッケージ版 Desktop・HEAD チェックアウトの dev 起動）で完了しています（`docs/VERIFICATION.md`）。セッション単位は本体側との契約を変えないプラグイン内完結の変更で、上の自動テストで確定しています。
+既知の制限: 本体パッチは上流 main の特定コミットへ移植した差分で、本体の更新でツリーが前进すると適用できなくなります（2026-10-28 の追従記録を参照）。プラグイン側の集計・表示はこの差分の有無だけで決まり、本体が前进しても契約は変わりません。Desktop 表示の実機検証は 2 つの稼働形態（パッケージ版 Desktop・HEAD チェックアウトの dev 起動）で完了しており、2026-10-28 には現行本体へパッチを移植して gateway を再起動した後のパッケージ版 Desktop でも、試験用 SSE endpoint で数値表示と `—` の両方を確認しています（`docs/VERIFICATION.md`）。実接続の provider での目視確認は未実施のままです。セッション単位は本体側との契約を変えないプラグイン内完結の変更で、上の自動テストで確定しています。
 
 ## 制約と非目標
 
@@ -132,5 +148,5 @@ Hermes 公式の検証ゲート（手動での実行です。公開 CI は上記
 
 ## ライセンス
 
-MIT（`LICENSE`）。`patches/decode-hook.patch` は上流 Hermes（NousResearch/hermes-agent）の該当コミット（上流 main の固定コミットと v0.22.4 タグコミットの二つの基準へ適用します）を基準にした差分で、上流派生コードを含みます。その著作権表示を `THIRD_PARTY_NOTICES.md` に記載します（本体パッチを当リポジトリで再配布する限り取り除かない）。
+MIT（`LICENSE`）。`patches/decode-hook.patch` は上流 Hermes（NousResearch/hermes-agent）の固定 main コミットを基準にした差分で、上流派生コードを含みます。その著作権表示を `THIRD_PARTY_NOTICES.md` に記載します（本体パッチを当リポジトリで再配布する限り取り除かない）。
 
