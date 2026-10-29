@@ -155,3 +155,13 @@ Desktop までの伝達を、既存の環境へ触れない分離インスタン
 プラグイン側（集計・表示・CI の他の 2 ジョブ）は無変更です。基準追従のコミットはローカルまでで、push は行っていません。公開 CI がこの pin で 3 ジョブを再実行するのは push 以降になります。
 
 実機側は前の基準のまま残っています。実機のインストール（`main` を追う更新経路）は `0431192d69…`（`v0.22.5+canary.20261028T064834Z-45-g0431192d69`）にあり、計測配線は未コミットの作業ツリー変更として 7 ファイルに入っています（`git status` は上記 7 ファイルが dirty、`decode_seconds` の走査は 16 件）。本体が新基準以降へ更新されたあとは、そのツリーへ再生成した差分を再適用する必要があります。実プロバイダ（Codex サブスクリプション・Ollama Cloud・ローカル LLM）での Desktop 表示は今回の作業でも実施していません（前節どおり未確認のままです）。
+
+## 上流 PR #139204 の基準追従（2026-10-29、head `41ea0303ff…`）
+
+上流 PR のブランチ `Wepoi9/hermes-agent:feat/decode-measure-hook` を基準 `145f26b5a5…` 之上へ更新しました（`--force-with-lease`、`0bbdee3787…` → `41ea0303ff…`）。fork ブランチのみで、上流 `main` へは書き込んでいません（push 後の上流 main は `ef75bc7088…`）。
+
+- 旧ブランチの 4 コミットを新基準へ 3-way replay すると `agent/chat_completion_helpers.py` と `agent/codex_runtime.py` が衝突しました（上流が `_CodexResponseAssembler` へ `saw_answer_item_added` を追加、`_bedrock_converse_call` の client 生成にモデルを渡す行を変更）。中間コミットの途中状態を保つ意味はないため、新旧の差分内容をそのまま 1 コミットへ squash しています。
+- 追加 560・削除 7 とハンク 32 本は旧ブランチの差分と一致し（追加・削除行 567 行はバイト一致、相違は基準漂移による context 行のみ）、新 head のツリーは `patches/decode-hook.patch` の適用後 blob と 7 ファイルすべてで一致しました。GitHub が読む PR 差分も hunk 本文・context 行・追加/削除行が `patches/decode-hook.patch` と一致します（GitHub 側は index の省略長が 12 文字、ハンクの関数名表示が異なるだけです）。
+- 更新後の head ツリーを fork clone 専用の test environment（同じ `uv.lock`、Python 3.14.7）で実行し、計測テスト `26 passed`、関連スイート 12 ファイル `209 passed, 4 skipped`（失敗 0）を確認しました。実行方法は前節と同じ（pytest 直接実行）。
+- PR 状態（更新直後の読み取り）: `OPEN`・非 Draft・`mergeable: MERGEABLE`・レビュー 0 件・コメント 0 件・1 コミット。上流のワークフローは push 後に `action_required` になり、メンテナの承認を待つ状態です（CI・Docker Build・Nix flake check・Label rerun・Plugin Catalog CI、`Docs Search Monitor` の 1 本だけが success）。つまり上流 CI は緑ではなく、承認ゲートで止まっています。原因が最初のコントリビューション承認なのか他の条件なのかは、GitHub の読み取りでは確定できません。
+- PR 本文は現行の事実へ更新しました。古い基準の記述と v0.22.2 / v0.22.4 ツリーへの適用に関する記述は削除し、Windows での直接実行と GitHub Actions の検証を区別し、当リポジトリの `patches/decode-hook.patch` はローカルコミット `310b973` の内容と一致する旨（未 push なので当リポジトリの公開 CI は新基準で未実行）を明記しています。
