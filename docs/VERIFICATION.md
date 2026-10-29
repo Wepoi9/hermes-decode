@@ -145,7 +145,7 @@ Desktop までの伝達を、既存の環境へ触れない分離インスタン
 | 旧パッチの適用可否（新基準） | `git apply --check` は exit 0。reject なし（計測配線の移植は不要だった） |
 | パッチ再生成 | `git diff` で再生成。7 ファイル・560 追加 / 7 削除は旧パッチと同じ形、ハンクヘッダ 32 本も一致、差分の本文の増減は 0 件。変わったのは `agent/chat_completion_helpers.py` の `index` の前置イメージだけ（`d8a4b815ae` → `c682fbd4d7`、適用後は `a23f0c48c9` → `3f73092489`） |
 | 往復の確認 | まっさらなツリーで `git apply --check`（exit 0）→ `git apply --3way --check`（exit 0）→ 適用（変更は上記 7 ファイルのみ）→ `git apply --reverse` で `git status` clean に戻る |
-| RED（パッチ無しの計測テスト 2 ファイル） | `10 passed`（上流側の既存テストだけが存在し、このツリーに `decode_seconds` の配線はない） |
+| パッチ適用前の既存テスト（計測テスト 2 ファイル、パッチ無し） | `10 passed`（上流側の既存テストだけが存在し、このツリーに `decode_seconds` の配線はない。この節では失敗を測っていないので RED とは呼ばない。RED として失敗を実測したのは 2026-10-28 節の `23 failed, 3 passed` の方です） |
 | GREEN（パッチ適用後の計測テスト 2 ファイル） | `26 passed` |
 | 既存の関連スイート（パッチ適用後） | `209 passed, 4 skipped`（失敗 0。`tests/agent` の streaming・Codex Responses adapter・run_agent codex_responses・turn response intake relay・Codex runtime live events・stream retry backoff・plugin stream hooks・usage anchor・stream single writer とその guard、`tests/e2e` の relay native OpenAI・Anthropic stream の計 12 ファイル） |
 | 上流 main がまだ計測を受け付けていないこと | 新基準のまっさらなツリーで `agent/*.py` を `decode_seconds` / `_last_api_decode_seconds` で走査して 0 件、`agent/turn_response_intake.py` は `first_chunk_at` だけを渡す |
