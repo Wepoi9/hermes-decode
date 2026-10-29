@@ -10,146 +10,109 @@ SPEC.loader.exec_module(plugin)
 
 
 def test_single_sample_speed():
-    state = plugin.DecodeAggregator()
-    result = state.record("session", "model", None, {"output_tokens": 300}, 3)
+    result = plugin.DecodeAggregator().record("s", {"output_tokens": 300}, 3)
     assert result == {"tok_per_sec": 100, "valid_samples": 1, "measured": True}
 
 
 def test_ratio_of_sums_not_mean_of_rates():
     state = plugin.DecodeAggregator()
-    state.record("s", "m", None, {"output_tokens": 120}, 2)
-    result = state.record("s", "m", None, {"output_tokens": 180}, 4)
+    state.record("s", {"output_tokens": 120}, 2)
+    result = state.record("s", {"output_tokens": 180}, 4)
     assert result["tok_per_sec"] == 50
     assert result["tok_per_sec"] != (60 + 45) / 2
 
 
-def test_speed_is_rounded_half_up_like_the_core_item():
-    # 3 tokens over 2 seconds is exactly 1.5: the published value must round
-    # half up (the core status-bar item's `Math.round`), not truncate.
+def test_speed_is_rounded_half_up():
     state = plugin.DecodeAggregator()
-    assert state.record("s", "m", None, {"output_tokens": 3}, 2)["tok_per_sec"] == 2
-    assert state.record("s2", "m", None, {"output_tokens": 5}, 2)["tok_per_sec"] == 3
+    assert state.record("s", {"output_tokens": 3}, 2)["tok_per_sec"] == 2
+    assert state.record("s2", {"output_tokens": 5}, 2)["tok_per_sec"] == 3
 
 
-def test_unmeasured_latest_call_reports_no_current_speed():
+def test_unmeasured_call_keeps_prior_cumulative_speed():
     state = plugin.DecodeAggregator()
-    state.record("s", "m", None, {"output_tokens": 300}, 3)
-    result = state.record("s", "m", None, None, None)
-    # The latest call measured nothing, so the readout is empty even though the
-    # window still holds the earlier measured sample.
-    assert result == {"tok_per_sec": None, "valid_samples": 1, "measured": False}
-    assert len(state.history_for("s", None)) == 2
+    assert state.record("s", None, None) == {
+        "tok_per_sec": None, "valid_samples": 0, "measured": False
+    }
+    state.record("s", {"output_tokens": 300}, 3)
+    assert state.record("s", None, None) == {
+        "tok_per_sec": 100, "valid_samples": 1, "measured": False
+    }
+    assert state.totals_for("s") == (300, 3, 1)
 
 
-def test_history_is_reused_at_the_next_measured_call():
+def test_more_than_ten_calls_never_evict_older_measurements():
     state = plugin.DecodeAggregator()
-    state.record("s", "m", None, {"output_tokens": 300}, 3)
-    state.record("s", "m", None, None, None)
-    result = state.record("s", "m", None, {"output_tokens": 300}, 3)
-    # The unmeasured call stayed in the window, so the next measured call
-    # aggregates the history again.
-    assert result == {"tok_per_sec": 100, "valid_samples": 2, "measured": True}
-
-
-def test_eleventh_call_evicts_oldest_sample():
-    state = plugin.DecodeAggregator()
-    state.record("s", "m", None, {"output_tokens": 10000}, 1)
+    state.record("s", {"output_tokens": 10000}, 1)
     for _ in range(10):
-        result = state.record("s", "m", None, {"output_tokens": 10}, 1)
-    assert len(state.history_for("s", None)) == 10
-    assert result["tok_per_sec"] == 10
-    assert result["valid_samples"] == 10
+        result = state.record("s", {"output_tokens": 10}, 1)
+    assert result["valid_samples"] == 11
+    assert result["tok_per_sec"] == 918
+    assert state.totals_for("s") == (10100, 11, 11)
 
 
-def test_sessions_never_share_a_window():
+def test_sessions_never_share_totals():
     state = plugin.DecodeAggregator()
-    first = state.record("s-1", "m", None, {"output_tokens": 200}, 2)
-    second = state.record("s-2", "m", None, {"output_tokens": 200}, 5)
-    assert (first["valid_samples"], second["valid_samples"]) == (1, 1)
-    assert (first["tok_per_sec"], second["tok_per_sec"]) == (100, 40)
-    assert state.retained_window_count == 2
+    first = state.record("s-1", {"output_tokens": 200}, 2)
+    second = state.record("s-2", {"output_tokens": 200}, 5)
+    assert first["tok_per_sec"] == 100
+    assert second["tok_per_sec"] == 40
+    assert state.totals_for("s-1") == (200, 2, 1)
 
 
-def test_connection_endpoints_stay_isolated_inside_one_session():
-    state = plugin.DecodeAggregator()
-    via_a = state.record("s", "m", "c-a", {"output_tokens": 200}, 2)
-    via_b = state.record("s", "m", "c-b", {"output_tokens": 200}, 4)
-    assert (via_a["tok_per_sec"], via_b["tok_per_sec"]) == (100, 50)
-    assert (via_a["valid_samples"], via_b["valid_samples"]) == (1, 1)
-    assert len(state.history_for("s", "c-a")) == 1
-    assert len(state.history_for("s", "c-b")) == 1
-
-
-def test_model_change_resets_the_session_history():
-    state = plugin.DecodeAggregator()
-    first = state.record("s", "m1", None, {"output_tokens": 200}, 2)
-    second = state.record("s", "m2", None, {"output_tokens": 200}, 5)
-    third = state.record("s", "m1", None, {"output_tokens": 200}, 4)
-    assert [result["valid_samples"] for result in (first, second, third)] == [1, 1, 1]
-    # The old model's measurement is gone from this session, not borrowed back.
-    assert len(state.history_for("s", None)) == 1
-    assert state.history_for("s", None)[0] == (200.0, 4.0)
+def test_model_and_endpoint_changes_keep_session_cumulative(monkeypatch):
+    results = emitted_hooks(monkeypatch, [
+        {"session_id": "s", "provider": "p1", "model": "m1",
+         "base_url": "https://example.invalid/a",
+         "usage": {"output_tokens": 200}, "decode_seconds": 2},
+        {"session_id": "s", "provider": "p2", "model": "m2",
+         "base_url": "https://example.invalid/b",
+         "usage": {"output_tokens": 200}, "decode_seconds": 4},
+    ])
+    assert [p["valid_samples"] for p in results] == [1, 2]
+    assert [p["tok_per_sec"] for p in results] == [100, 67]
 
 
 def emitted_hooks(monkeypatch, calls):
-    """Run the hook on a fresh aggregator and return the payloads it broadcast."""
     emitted = []
     monkeypatch.setattr(plugin, "_broadcast", lambda event, payload: emitted.append((event, payload)))
-    plugin._AGGREGATOR = plugin.DecodeAggregator()
+    monkeypatch.setattr(plugin, "_AGGREGATOR", plugin.DecodeAggregator())
     for call in calls:
         plugin.post_api_request(**call)
-    # Every sample frame travels under the one event name the Desktop half subscribes to.
-    assert {event for event, _payload in emitted} == {"sample"} or emitted == []
-    return [payload for _event, payload in emitted]
+    assert all(event == "sample" for event, _ in emitted)
+    return [payload for _, payload in emitted]
 
 
 def test_hook_sessions_share_nothing(monkeypatch):
-    emitted = emitted_hooks(monkeypatch, [
-        {"session_id": "first", "provider": "p", "model": "m",
+    results = emitted_hooks(monkeypatch, [
+        {"session_id": "s1", "provider": "p", "model": "m",
          "usage": {"output_tokens": 200}, "decode_seconds": 2},
-        {"session_id": "second", "provider": "p", "model": "m",
+        {"session_id": "s2", "provider": "p", "model": "m",
          "usage": {"output_tokens": 200}, "decode_seconds": 5},
     ])
-    assert [payload["valid_samples"] for payload in emitted] == [1, 1]
-    assert [payload["tok_per_sec"] for payload in emitted] == [100, 40]
-    assert [emitted[-1]["session_id"], emitted[-2]["session_id"]] == ["second", "first"]
+    assert [p["tok_per_sec"] for p in results] == [100, 40]
 
 
-def test_another_model_never_borrows_the_window(monkeypatch):
-    emitted = emitted_hooks(monkeypatch, [
-        {"session_id": "s", "provider": "p", "model": "m1",
-         "usage": {"output_tokens": 200}, "decode_seconds": 2},
-        {"session_id": "s", "provider": "p", "model": "m2",
-         "usage": {"output_tokens": 200}, "decode_seconds": 2},
-    ])
-    assert [payload["valid_samples"] for payload in emitted] == [1, 1]
-
-
-def test_endpoint_key_is_normalized_and_stays_in_process():
-    # The endpoint key only ever indexes this process's own windows; the
-    # desktop half never sees it, so no digest is needed.
-    assert plugin._endpoint_key("https://private.invalid") == "https://private.invalid"
-    assert plugin._endpoint_key("https://private.invalid/") == "https://private.invalid"
-    assert plugin._endpoint_key(" https://Private.Invalid ") == "https://private.invalid"
-    assert plugin._endpoint_key("https://other.invalid") != plugin._endpoint_key("https://private.invalid")
-    assert plugin._endpoint_key(None) is None
-    assert plugin._endpoint_key("") is None
-    assert plugin._endpoint_key("   / ") is None
-
-
-def test_payload_carries_no_endpoint_or_generation_identity(monkeypatch):
-    payload = emitted_hooks(monkeypatch, [
+def test_hook_emits_only_contract_fields(monkeypatch):
+    result = emitted_hooks(monkeypatch, [
         {"session_id": "s", "provider": "p", "model": "m",
-         "usage": {"output_tokens": 200}, "decode_seconds": 2,
-         "base_url": "https://private.invalid"},
+         "usage": {"output_tokens": 300}, "decode_seconds": 3,
+         "response": "private", "base_url": "https://private.invalid"},
     ])[-1]
-    # The endpoint never reaches the desktop half: no URL, no digest of it, and
-    # no process-generation id either.
-    assert "conn" not in payload and "gen" not in payload
-    assert "private.invalid" not in json.dumps(payload)
+    assert result == {"schema_version": 3, "session_id": "s", "provider": "p",
+                      "model": "m", "tok_per_sec": 100,
+                      "measured": True, "valid_samples": 1}
+    assert "private.invalid" not in json.dumps(result)
 
 
-def test_invalid_metrics_and_usage_are_unmeasured():
+def test_hook_missing_identity_is_silent(monkeypatch):
+    assert emitted_hooks(monkeypatch, [
+        {"provider": "p", "model": "m"},
+        {"session_id": "s", "model": "m"},
+        {"session_id": "s", "provider": "", "model": "m"},
+    ]) == []
+
+
+def test_invalid_metrics_are_not_accumulated():
     state = plugin.DecodeAggregator()
     cases = [
         ({"output_tokens": 12}, float("nan")),
@@ -162,117 +125,76 @@ def test_invalid_metrics_and_usage_are_unmeasured():
         ({"output_tokens": float("inf")}, 1),
     ]
     for usage, seconds in cases:
-        result = state.record("p", "m", None, usage, seconds)
-        assert result["tok_per_sec"] is None
-        assert result["valid_samples"] == 0
-        assert result["measured"] is False
+        result = state.record("s", usage, seconds)
+        assert result == {"tok_per_sec": None, "valid_samples": 0, "measured": False}
 
 
-def test_hook_emits_minimal_payload(monkeypatch):
-    payload = emitted_hooks(monkeypatch, [
-        {"session_id": "session", "provider": "provider", "model": "model",
-         "usage": {"output_tokens": 300}, "decode_seconds": 3,
-         "response": "private", "base_url": "https://private.invalid"},
-    ])[-1]
-    assert payload == {"schema_version": 2, "session_id": "session", "provider": "provider",
-                       "model": "model", "tok_per_sec": 100, "measured": True,
-                       "valid_samples": 1}
-
-
-def test_hook_without_identity_stays_silent(monkeypatch):
-    emitted = emitted_hooks(monkeypatch, [
-        {"provider": "p", "model": "m"},
-        {"session_id": "s", "model": "m"},
-        {"session_id": "s", "provider": "", "model": "m"},
-    ])
-    assert emitted == []
-
-
-def test_windows_are_bounded_to_eight_session_endpoint_pairs():
+def test_invalid_latest_does_not_clear_existing_total():
     state = plugin.DecodeAggregator()
-    for index in range(9):
-        state.record(f"s-{index}", "m", None, {"output_tokens": 10}, 1)
-    assert state.retained_window_count == 8
-    assert state.history_for("s-0", None) == ()
-    assert len(state.history_for("s-8", None)) == 1
-    # The evicted session holds nothing — not a window and not a remembered model:
-    # its next call starts a fresh window instead of resuming the evicted one.
-    assert state.record("s-0", "m", None, {"output_tokens": 10}, 1)["valid_samples"] == 1
-    assert state.retained_window_count == 8
+    state.record("s", {"output_tokens": 100}, 1)
+    assert state.record("s", {"output_tokens": 100}, 0) == {
+        "tok_per_sec": 100, "valid_samples": 1, "measured": False
+    }
 
 
-def test_register_installs_only_post_api_request_hook():
-    class Context:
-        registrations = []
-
-        def register_hook(self, name, callback):
-            self.registrations.append((name, callback))
-
-    context = Context()
-    plugin.register(context)
-    assert context.registrations == [("post_api_request", plugin.post_api_request)]
-
-
-def test_concurrent_model_calls_keep_windows_consistent():
+def test_overflow_cannot_poison_cumulative_totals():
     state = plugin.DecodeAggregator()
-    keys = [(f"s-{index}", f"c-{index}") for index in range(6)]
-    calls_per_key = 20
-    # A worker thread's failure is invisible to pytest, so workers report to the
-    # parent instead of asserting on their own stack.
+    state.record("s", {"output_tokens": 100}, 1)
+    result = state.record("s", {"output_tokens": 1e308}, 1e308)
+    assert result["measured"] is True
+    result = state.record("s", {"output_tokens": 1e308}, 1e308)
+    assert result["measured"] is False
+    assert result["valid_samples"] == 2
+
+
+def test_session_history_is_not_lru_evicted():
+    state = plugin.DecodeAggregator()
+    for index in range(100):
+        state.record(f"s-{index}", {"output_tokens": 10}, 1)
+    assert state.record("s-0", {"output_tokens": 10}, 1)["valid_samples"] == 2
+
+
+def test_concurrent_calls_keep_cumulative_totals():
+    state = plugin.DecodeAggregator()
+    barrier = threading.Barrier(7)
     failures = []
 
     def hammer(index):
-        session, endpoint = keys[index]
         barrier.wait()
         try:
-            for call_index in range(calls_per_key):
-                result = state.record(session, f"m-{index}", endpoint, {"output_tokens": 10}, 1)
-                assert result["valid_samples"] == min(call_index + 1, plugin.WINDOW_SIZE)
+            for _ in range(40):
+                state.record("shared" if index < 2 else f"s-{index}",
+                             {"output_tokens": 10}, 1)
         except Exception as error:
             failures.append(error)
 
-    def shared_hammer():
-        barrier.wait()
-        try:
-            for _ in range(calls_per_key):
-                state.record("shared", "m-shared", None, {"output_tokens": 10}, 1)
-        except Exception as error:
-            failures.append(error)
-
-    barrier = threading.Barrier(len(keys) + 2)
-    threads = [threading.Thread(target=hammer, args=(index,)) for index in range(len(keys))]
-    threads.append(threading.Thread(target=shared_hammer))
-    threads.append(threading.Thread(target=shared_hammer))
+    threads = [threading.Thread(target=hammer, args=(i,)) for i in range(6)]
     for thread in threads:
         thread.start()
+    barrier.wait()
     for thread in threads:
         thread.join()
-
-    assert failures == [], f"concurrent record failed: {failures!r}"
-    # Concurrent calls never lost an append or blurred a window: every hammered
-    # window holds exactly its last ten samples, and the LRU cap stayed honest.
-    assert state.retained_window_count == 7
-    for session, endpoint in keys:
-        window = state.history_for(session, endpoint)
-        assert len(window) == plugin.WINDOW_SIZE
-        assert all(sample is not None for sample in window)
-    assert len(state.history_for("shared", None)) == plugin.WINDOW_SIZE
+    assert failures == []
+    assert state.totals_for("shared") == (800, 80, 80)
+    for i in range(2, 6):
+        assert state.totals_for(f"s-{i}") == (400, 40, 40)
 
 
-def test_plugin_reload_resets_the_aggregator_state():
-    previous_aggregator = plugin._AGGREGATOR
-    previous_aggregator.record("s", "m", None, {"output_tokens": 100}, 1)
+def test_plugin_reload_resets_in_memory_state():
+    previous = plugin.DecodeAggregator()
+    previous.record("s", {"output_tokens": 100}, 1)
+    spec = importlib.util.spec_from_file_location("hermes_decode_plugin", MODULE_PATH)
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    assert fresh._AGGREGATOR.totals_for("s") == (0.0, 0.0, 0)
+    assert previous.totals_for("s") == (100, 1, 1)
 
-    fresh_spec = importlib.util.spec_from_file_location("hermes_decode_plugin", MODULE_PATH)
-    fresh = importlib.util.module_from_spec(fresh_spec)
-    fresh_spec.loader.exec_module(fresh)
 
-    assert fresh._AGGREGATOR is not previous_aggregator
-    emitted = []
-    fresh._broadcast = lambda event, payload: emitted.append(payload)
-    fresh.post_api_request(session_id="s", provider="p", model="m",
-                           usage={"output_tokens": 200}, decode_seconds=2)
-    assert emitted[-1]["valid_samples"] == 1
-    assert emitted[-1]["tok_per_sec"] == 100
-    # No persistence owner exists: the discarded instance's samples are simply gone.
-    assert len(previous_aggregator.history_for("s", None)) == 1
+def test_register_only_uses_post_api_request():
+    class Context:
+        registrations = []
+        def register_hook(self, name, callback):
+            self.registrations.append((name, callback))
+    ctx = Context()
+    plugin.register(ctx)
+    assert ctx.registrations == [("post_api_request", plugin.post_api_request)]
