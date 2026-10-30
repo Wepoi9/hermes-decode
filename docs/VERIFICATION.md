@@ -194,6 +194,11 @@ Desktop までの伝達を、既存の環境へ触れない分離インスタン
 - 本体の補助呼び出しは集計に混ざりません。ターン完了後のメモリ抽出呼び出し（`aux`）が挟まった後も表示は `44 t/s` のままでした（`agent/AGENTS.md` の「main-loop の pre/post_api_request は aux 呼び出しで発火しない」どおり）。
 - ゲートウェイ側では `<sandbox>/logs/agent.log` に `capability_check plugin=hermes-decode` とプラグイン discovery 完了が残っています。フック発火そのものは、Desktop 側表示がターン完了ごとに更新されたこと（上記の実測値）が端到端の証拠です。renderer のコンソールにプラグイン load 失敗は出ていません。
 
+### CDP による再確認（同日、別の接続経路）
+
+同じ隔離 sandbox で Electron に `--remote-debugging-port=19299` を与え、別プロセスから CDP を読みました（`/json/version` は `Chrome/152.0.7977.167`・`Protocol-Version 1.3`、User-Agent に sandbox アプリ名が入る）。`connectOverCDP` で開いたページからステータスバー項目テキストを拾うと、アプリ側（Playwright の Electron チャンネル）と同じ値になりました: 1 呼び目 `409 t/s`（100 tokens / 約 0.25 秒）、2 呼び目 `83 t/s`（Σ 110 / Σ 約 1.33 秒。速度の平均なら約 224）、3 呼び目 `73 t/s`（Σ 120 / Σ 約 1.64 秒。平均なら約 161）、usage を載せない 4 呼び目後も `73 t/s` のまま。両経路の読み取りが一致したので、表示は renderer の実 DOM の値です（ホバー泡の文言は属性に入らないため、泡の目視確認は過去の節どおり実マウスホバー側の記録に依存します）。
+
+
 ### compaction をまたいだ累積
 
 - Desktop の `/compress` は `session.compress` RPC（`src/lib/desktop-slash-commands.ts:273-281`）として実行され、実際に圧縮がコミットされました。直前のリクエスト history が 290KB / 16 messages → 圧縮後 142KB / 8 messages。このとき gateway ログの `session=` は同じ値のまま（in-place）で、表示は `67 t/s` を維持しました。in-place では本体が `old_session_id = ""` を渡すので当プラグインは何もしません（no-op）。
@@ -204,4 +209,4 @@ Desktop までの伝達を、既存の環境へ触れない分離インスタン
 
 ### 撤去
 
-プロブが起動した Electron と隔離 gateway（`tmp/hermes-fork/.venv` 由来の 12 プロセス）を止めて、sandbox home・専用 user-data-dir・プロブスクリプトの写しを削除しました。使ったポート（18765/18931/18941/18951/18961/18971/19222/19321）は listener 0 件、`tmp/hermes-fork` の tracked 変更は無く、ライブの Hermes home と `main`（`12a6f7a`）は無変更です。
+プロブが起動した Electron と隔離 gateway（`tmp/hermes-fork/.venv` 由来のプロセス。アプリ側は `app.close()`、gateway は `Get-CimInstance Win32_Process` でコマンドラインが `tmp\hermes-fork\.venv` を指すものだけを確認して `Stop-Process`）を止めて、sandbox home・専用 user-data-dir・リポジトリへ置いたプロブスクリプトの写しを削除しました。使ったポート（18765/18931/18941/18951/18961/18971/18981/19222/19299/19321）は listener 0 件、`tmp/hermes-fork` の tracked 変更は無く、ライブの Hermes home（`SCHEMA_VERSION = 2` のまま・gateway 稼働継続）と `main`（`12a6f7a`）は無変更です。
