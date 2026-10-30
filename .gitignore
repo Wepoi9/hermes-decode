@@ -7,3 +7,8 @@ dist/
 .venv/
 venv/
 .DS_Store
+
+# Local env files hold credentials; only the example template is tracked.
+.env
+.env.*
+!.env.example
