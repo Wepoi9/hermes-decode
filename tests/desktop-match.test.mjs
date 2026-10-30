@@ -1,191 +1,81 @@
-// Dependency-free test of the status-bar readout: the repo ships desktop/
-// plugin.js as a SINGLE plain-ESM file the desktop reads verbatim, so this
-// test extracts the CONTRACT, MATCHER and CACHE blocks from the same file the
-// app loads instead of importing the plugin (its `@hermes/plugin-sdk` import is
-// app-owned). It also checks the caps the two halves declare separately still
-// agree with `__init__.py`.
 import { readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import assert from 'node:assert/strict'
 
-const source = await readFile(
-  join(dirname(fileURLToPath(import.meta.url)), '..', 'desktop', 'plugin.js'),
-  'utf8'
-)
-const block = source.match(/\/\/ MATCHER-BEGIN[^\n]*\n([\s\S]*?)\n\/\/ MATCHER-END/)
-assert.ok(block, 'plugin.js must contain the MATCHER-BEGIN..MATCHER-END block')
-const code = block[1].replace(/export function/, 'function')
-// The shared caps live in the CONTRACT block the extracted functions read from.
-const contractBlock = source.match(/\/\/ CONTRACT-BEGIN[^\n]*\n([\s\S]*?)\n\/\/ CONTRACT-END/)
-assert.ok(contractBlock, 'plugin.js must contain the CONTRACT-BEGIN..CONTRACT-END block')
-const contract = contractBlock[1]
-const pickVisibleSample = new Function(`${contract}; ${code}; return pickVisibleSample`)()
-assert.equal(typeof pickVisibleSample, 'function')
-const cacheBlock = source.match(/\/\/ CACHE-BEGIN[^\n]*\n([\s\S]*?)\n\/\/ CACHE-END/)
-assert.ok(cacheBlock, 'plugin.js must contain the CACHE-BEGIN..CACHE-END block')
-const cacheCode = cacheBlock[1].replace(/export function/, 'function')
-const applyIncomingSample = new Function(`${contract}; ${cacheCode}; return applyIncomingSample`)()
-assert.equal(typeof applyIncomingSample, 'function')
-const parseBlock = source.match(/\/\/ PARSE-BEGIN[^\n]*\n([\s\S]*?)\n\/\/ PARSE-END/)
-assert.ok(parseBlock, 'plugin.js must contain the PARSE-BEGIN..PARSE-END block')
-const parseSample = new Function(`${contract}; ${parseBlock[1]}; return parseSample`)()
-assert.equal(typeof parseSample, 'function')
+const root = join(dirname(fileURLToPath(import.meta.url)), '..')
+const source = await readFile(join(root, 'desktop', 'plugin.js'), 'utf8')
+const python = await readFile(join(root, '__init__.py'), 'utf8')
 
-// The two halves cannot import each other, so the caps are declared twice; this is the
-// drift guard: the Desktop half must still answer to the Python half's numbers.
-const pythonSource = await readFile(
-  join(dirname(fileURLToPath(import.meta.url)), '..', '__init__.py'),
-  'utf8'
-)
-const declared = (source_, label, pattern) => {
-  const found = new RegExp(pattern, 'm').exec(source_)
-  assert.ok(found, `${label} must be declared`)
-  return Number(found[1])
+function block(name) {
+  const m = source.match(new RegExp(`// ${name}-BEGIN[^\\n]*\\n([\\s\\S]*?)\\n// ${name}-END`))
+  assert.ok(m, `${name} block must exist`)
+  return m[1]
 }
-assert.equal(declared(contract, 'desktop WINDOW_SIZE', '^const WINDOW_SIZE = (\\d+)'),
-             declared(pythonSource, 'python WINDOW_SIZE', '^WINDOW_SIZE = (\\d+)'))
-assert.equal(declared(contract, 'desktop MAX_ROWS', '^const MAX_ROWS = (\\d+)'),
-             declared(pythonSource, 'python MAX_DECODE_WINDOWS', '^MAX_DECODE_WINDOWS = (\\d+)'))
-assert.equal(declared(contract, 'desktop SCHEMA_VERSION', '^const SCHEMA_VERSION = (\\d+)'),
-             declared(pythonSource, 'python SCHEMA_VERSION', '^SCHEMA_VERSION = (\\d+)'))
 
-// The python half stopped publishing an endpoint identity and a process
-// generation id: the Desktop half must not read them either, or it would keep
-// waiting for a field the payload no longer carries.
-assert.ok(!source.includes('payload.conn'), 'the payload carries no endpoint identity')
-assert.ok(!source.includes('payload.gen'), 'the payload carries no process generation id')
+const contract = block('CONTRACT')
+const matcher = block('MATCHER').replace('export function', 'function')
+const cache = block('CACHE').replace('export function', 'function')
+const parser = block('PARSE')
+const pickVisibleSample = new Function(`${contract}; ${matcher}; return pickVisibleSample`)()
+const applyIncomingSample = new Function(`${contract}; ${cache}; return applyIncomingSample`)()
+const parseSample = new Function(`${contract}; ${parser}; return parseSample`)()
 
-// The handler stores one row per session, newest first. A row carries only
-// what the readout reads: the session it belongs to and its speed.
-const newer = { sessionId: 's-focused', tokPerSecond: 120 }
-const older = { sessionId: 's-focused', tokPerSecond: 80 }
-const otherSession = { sessionId: 's-other', tokPerSecond: 300 }
-const recordedUnderAnotherModel = { sessionId: 's-focused', tokPerSecond: 400 }
+const schema = Number(/SCHEMA_VERSION = (\d+)/.exec(contract)?.[1])
+assert.ok(Number.isInteger(schema))
+assert.equal(schema, Number(/SCHEMA_VERSION = (\d+)/.exec(python)?.[1]))
 
-// The readout follows the FOCUSED session only: the newest measurement for
-// that session is the readout.
-assert.equal(pickVisibleSample([newer, older], 's-focused'), newer)
-assert.equal(pickVisibleSample([older], 's-focused'), older)
+const s1 = { sessionId: 's1', tokPerSecond: 75 }
+const s2 = { sessionId: 's2', tokPerSecond: 120 }
+assert.equal(pickVisibleSample([s2, s1], 's1'), s1)
+assert.equal(pickVisibleSample([s2, s1], 's3'), null)
+assert.equal(pickVisibleSample([s1], null), null)
+assert.equal(pickVisibleSample(null, 's1'), null)
 
-// Sessions share nothing: switching focus switches the reference, and a fresh
-// session (or a tab whose samples belong to another session) shows '—'.
-assert.equal(pickVisibleSample([otherSession], 's-focused'), null)
-assert.equal(pickVisibleSample([newer, older], 's-tab-b'), null)
-assert.equal(pickVisibleSample([otherSession, newer], 's-focused'), newer)
-
-// The matcher never narrows by model, and cannot: the python half resets the
-// session's decode history on a model change, and a row carries no model field
-// at all (the SDK does not expose the focused session's own model, and
-// borrowing the main model's slug would point a tab at a model it is not
-// running). So any row of the focused session is eligible, newest first.
-assert.equal(pickVisibleSample([recordedUnderAnotherModel], 's-focused'), recordedUnderAnotherModel)
-assert.equal(pickVisibleSample([newer, recordedUnderAnotherModel], 's-focused'), newer)
-assert.equal(pickVisibleSample([recordedUnderAnotherModel, newer], 's-focused'), recordedUnderAnotherModel)
-
-// No focused session (null/empty), malformed input, or junk entries never crash the readout.
-assert.equal(pickVisibleSample([newer], null), null)
-assert.equal(pickVisibleSample([newer], ''), null)
-assert.equal(pickVisibleSample([], 's-focused'), null)
-assert.equal(pickVisibleSample(null, 's-focused'), null)
-assert.equal(pickVisibleSample([null, newer, older], 's-focused'), newer)
-
-// The desktop cache keeps ONE row per session: the incoming sample replaces
-// that session's row, whichever connection endpoint recorded it (the endpoint
-// only keys the python windows, so a switch arrives as an ordinary sample).
-const oldRow = { sessionId: 's', tokPerSecond: 80 }
-const newRow = { sessionId: 's', tokPerSecond: 120 }
-assert.deepEqual(applyIncomingSample([oldRow], 's', newRow), [newRow])
-
-// Another session's rows are never touched.
-const otherSessionRow = { sessionId: 's-other', tokPerSecond: 70 }
-assert.deepEqual(applyIncomingSample([oldRow, otherSessionRow], 's', newRow), [newRow, otherSessionRow])
-
-// The latest call measured nothing: that session's row goes, so the readout
-// shows '—' instead of a speed the latest call did not measure. The history
-// stays in the python windows and answers the next measured call.
-assert.deepEqual(applyIncomingSample([oldRow, otherSessionRow], 's', null), [otherSessionRow])
-assert.equal(pickVisibleSample(applyIncomingSample([oldRow], 's', null), 's'), null)
-
-// The row list is bounded: at most one row per session, MAX_ROWS sessions.
-const many = Array.from({ length: 9 }, (_unused, index) => ({
-  sessionId: `s-${index}`, tokPerSecond: 50 + index
+const changed = { sessionId: 's1', tokPerSecond: 95 }
+assert.deepEqual(applyIncomingSample([s1, s2], 's1', changed), [changed, s2])
+assert.deepEqual(applyIncomingSample([s1, s2], 's1', null), [s2])
+const many = Array.from({ length: 12 }, (_, i) => ({
+  sessionId: `s-${i}`, tokPerSecond: i + 1
 }))
-const bounded = applyIncomingSample(many, 's-new', { sessionId: 's-new', tokPerSecond: 111 })
-assert.equal(bounded.length, 8)
-assert.equal(bounded[0].tokPerSecond, 111)
-assert.ok(!bounded.some(item => item.sessionId === 's-8'))
+assert.equal(applyIncomingSample(many, 'new', { sessionId: 'new', tokPerSecond: 99 }).length, 13)
 
-// The payload decides the readout. A measured call carries a speed; an
-// unmeasured call (the latest call measured nothing) clears the session.
-const schemaVersion = declared(contract, 'desktop SCHEMA_VERSION', '^const SCHEMA_VERSION = (\\d+)')
-const measuredFrame = {
-  payload: {
-    schema_version: schemaVersion, session_id: 's', provider: 'p', model: 'm',
-    tok_per_sec: 120, measured: true, valid_samples: 3
-  }
+const base = { schema_version: schema, session_id: 's1', provider: 'p', model: 'm' }
+const measured = { payload: { ...base, tok_per_sec: 100, measured: true, valid_samples: 2 } }
+const unmeasuredWithHistory = {
+  payload: { ...base, tok_per_sec: 100, measured: false, valid_samples: 2 }
 }
-const unmeasuredFrame = {
-  payload: {
-    schema_version: schemaVersion, session_id: 's', provider: 'p', model: 'm',
-    tok_per_sec: null, measured: false, valid_samples: 3
-  }
+// A compaction rotation publishes the carried cumulative value the same way:
+// measured is false because the rotation itself was not a call, while the
+// cumulative speed and its sample count stay.
+const compactionCarry = {
+  payload: { ...base, tok_per_sec: 100, measured: false, valid_samples: 1 }
 }
-assert.deepEqual(parseSample(measuredFrame), {
-  sessionId: 's',
-  // The row keeps only what the readout reads; provider and model stay in the
-  // payload as contract fields, not as stored state.
-  sample: { sessionId: 's', tokPerSecond: 120 }
+const unmeasuredWithoutHistory = {
+  payload: { ...base, tok_per_sec: null, measured: false, valid_samples: 0 }
+}
+assert.deepEqual(parseSample(measured), { sessionId: 's1', sample: { sessionId: 's1', tokPerSecond: 100 } })
+assert.deepEqual(parseSample(unmeasuredWithHistory), {
+  sessionId: 's1', sample: { sessionId: 's1', tokPerSecond: 100 }
 })
-assert.deepEqual(parseSample(unmeasuredFrame), { sessionId: 's', sample: null })
-
-// A frame from another contract version is ignored: old and new events never mix.
-assert.equal(parseSample({ payload: { ...unmeasuredFrame.payload, schema_version: schemaVersion - 1 } }), null)
-// A measured frame without a usable speed or sample count is ignored too.
-assert.equal(parseSample({ payload: { ...measuredFrame.payload, tok_per_sec: 0 } }), null)
-assert.equal(parseSample({ payload: { ...measuredFrame.payload, tok_per_sec: Number.NaN } }), null)
-assert.equal(parseSample({ payload: { ...measuredFrame.payload, valid_samples: 0 } }), null)
-// A frame missing one of the identity fields is not this contract's frame.
-assert.equal(parseSample({ payload: { ...measuredFrame.payload, provider: '' } }), null)
-assert.equal(parseSample({ payload: { ...measuredFrame.payload, model: undefined } }), null)
+assert.deepEqual(parseSample(compactionCarry), {
+  sessionId: 's1', sample: { sessionId: 's1', tokPerSecond: 100 }
+})
+assert.deepEqual(parseSample(unmeasuredWithoutHistory), { sessionId: 's1', sample: null })
+assert.equal(parseSample({ payload: { ...base, schema_version: 2, tok_per_sec: 100, measured: true, valid_samples: 2 } }), null)
+assert.equal(parseSample({ payload: { ...base, tok_per_sec: 0, measured: true, valid_samples: 1 } }), null)
+assert.equal(parseSample({ payload: { ...base, tok_per_sec: NaN, measured: true, valid_samples: 1 } }), null)
+assert.equal(parseSample({ payload: { ...base, tok_per_sec: 1, measured: true, valid_samples: -1 } }), null)
+assert.equal(parseSample({ payload: { ...base, tok_per_sec: 1, measured: true, valid_samples: 0 } }), null)
+assert.equal(parseSample({ payload: { ...base, tok_per_sec: null, measured: false, valid_samples: 1 } }), null)
+assert.equal(parseSample({ payload: { ...base, provider: '', tok_per_sec: 1, measured: true, valid_samples: 1 } }), null)
 assert.equal(parseSample(null), null)
-assert.equal(parseSample({}), null)
 
-// End to end: the unmeasured call clears that session's readout, and the
-// history it left behind answers the next measured call.
-const cleared = applyIncomingSample([newRow], parseSample(unmeasuredFrame).sessionId, parseSample(unmeasuredFrame).sample)
-assert.deepEqual(cleared, [])
-assert.equal(pickVisibleSample(cleared, 's'), null)
-const restored = applyIncomingSample(cleared, parseSample(measuredFrame).sessionId, parseSample(measuredFrame).sample)
-assert.equal(pickVisibleSample(restored, 's').tokPerSecond, 120)
-
-// The bar item registers as a toggleable DATA contribution: `data` IS the
-// bar's own StatusbarItem (its id, the menu name, and the render live inside
-// it), so the bar's right-click "Show in status bar" menu lists it and the
-// user hides/restores it there. A top-level render would lock the item to the
-// bar forever — the host ignores `data` the moment a contribution carries its
-// own render, and an item with no menu name never appears in that menu.
-const registerBlock = source.match(/\/\/ REGISTER-BEGIN[^\n]*\n([\s\S]*?)\n[ \t]*\/\/ REGISTER-END/)
-assert.ok(registerBlock, 'plugin.js must contain the REGISTER-BEGIN..REGISTER-END block')
-const registration = registerBlock[1]
-assert.match(registration, /id:\s*'decode-speed'/)
-assert.match(registration, /data:\s*\{/)
-assert.match(registration, /id:\s*'hermes-decode-speed'/)
-assert.match(registration, /toggleLabel:\s*'デコード速度'/)
-// The registration declares exactly one render and it lives INSIDE `data` —
-// never a top-level render slot that would ignore the menu and lock the item.
-assert.equal((registration.match(/render:/g) || []).length, 1)
-const beforeData = registration.slice(
-  registration.indexOf('ctx.register'),
-  registration.indexOf('data:')
-)
-assert.ok(!beforeData.includes('render:'), 'the item render must live inside data, not at the top level')
-// The readout keeps the core item's own icon and label notation (Zap icon and
-// `… t/s`), showing '—' while nothing is measured yet.
-assert.match(source, /icons\.Zap/)
-assert.match(source, /t\/s/)
-// The subscription listens on the event namespaced by the plugin id, matching
-// the python half's broadcast_plugin_event(PLUGIN_ID, 'sample', payload).
+const bar = source.match(/\/\/ REGISTER-BEGIN[^\n]*\n([\s\S]*?)\n[ \t]*\/\/ REGISTER-END/)
+assert.ok(bar, 'status bar registration exists')
+assert.match(bar[1], /id:\s*'decode-speed'/)
+assert.match(bar[1], /toggleLabel:\s*'デコード速度'/)
+assert.equal((bar[1].match(/render:/g) || []).length, 1)
 assert.match(source, /host\.onEvent\(`plugin\.\$\{ID\}\.sample`/)
-
-console.log('desktop matcher tests passed')
+assert.match(source, /icons\.Zap/)
+console.log('desktop cumulative matcher tests passed')

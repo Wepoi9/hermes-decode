@@ -2,24 +2,12 @@ import { STATUSBAR_AREAS, Tip, atom, computed, host, icons, useValue } from '@he
 import { jsx } from 'react/jsx-runtime'
 
 const ID = 'hermes-decode'
-// CONTRACT-BEGIN (tests/desktop-match.test.mjs extracts this block verbatim, injects it
-// into the extracted matcher/cache blocks, and asserts these numbers still equal
-// WINDOW_SIZE / MAX_DECODE_WINDOWS / SCHEMA_VERSION in __init__.py — the two halves
-// cannot import each other, so this shared declaration is the drift guard)
-const WINDOW_SIZE = 10
-const MAX_ROWS = 8
-const SCHEMA_VERSION = 2
+// CONTRACT-BEGIN (tests extract this declaration to check the Python contract)
+const SCHEMA_VERSION = 3
 // CONTRACT-END
-// Hover tip: says only that the readout is the focused session's last WINDOW_SIZE decode
-// speeds — the history explanation is not repeated in the tooltip.
-const DESCRIPTION = `フォーカス中のセッションの直近${WINDOW_SIZE}回のデコード速度`
+const DESCRIPTION = 'フォーカス中のセッションの累積デコード速度（gateway再起動でリセット）'
 const sessionRows = atom([])
-// One row per session, newest first. The python half keeps the per-endpoint
-// windows and reports the readout of the call that just finished, so the
-// desktop half only has to remember the newest result of each session: the
-// focused session's newest row is the readout, another session's rows are
-// never shown, and a session that switches connection endpoint simply
-// replaces its own row instead of becoming ambiguous.
+
 // MATCHER-BEGIN (tests/desktop-match.test.mjs extracts this block verbatim)
 export function pickVisibleSample(rows, sessionId) {
   if (!Array.isArray(rows) || typeof sessionId !== 'string' || !sessionId) return null
@@ -28,17 +16,11 @@ export function pickVisibleSample(rows, sessionId) {
 // MATCHER-END
 // CACHE-BEGIN (tests/desktop-match.test.mjs extracts this block verbatim)
 export function applyIncomingSample(rows, sessionId, sample) {
-  // One row per session: the incoming sample replaces that session's row.
-  // An unmeasured call (sample === null) drops the row, so the readout shows
-  // '—' instead of a speed the latest call did not measure.
-  const others = rows.filter(item => !item || item.sessionId !== sessionId)
-  return [...(sample ? [sample] : []), ...others].slice(0, MAX_ROWS)
+  const others = (Array.isArray(rows) ? rows : []).filter(item => item && item.sessionId !== sessionId)
+  return sample ? [sample, ...others] : others
 }
 // CACHE-END
-// The SDK does not expose the focused session's own model, and borrowing the
-// main model's slug for it would point a tab's readout at a model it is not
-// running, so the matcher narrows by session only: the newest sample of the
-// focused session wins regardless of which model recorded it.
+
 const visibleSample = computed(
   [sessionRows, host.state.focusedStoredSessionId],
   (rows, sessionId) => pickVisibleSample(rows, sessionId)
@@ -46,12 +28,7 @@ const visibleSample = computed(
 
 function DecodeSpeed() {
   const sample = useValue(visibleSample)
-  // The core status-bar item reads `105 t/s` with a Zap icon and shows '—'
-  // while nothing is measured yet; the plugin keeps the identical icon and
-  // label notation so hiding the core item and showing this one swaps the
-  // readout, not the notation.
   const label = sample ? `${Math.round(sample.tokPerSecond)} t/s` : '—'
-
   return jsx(Tip, {
     label: DESCRIPTION,
     children: jsx('span', {
@@ -65,25 +42,20 @@ function DecodeSpeed() {
 function parseSample(event) {
   if (!event || typeof event !== 'object' || !event.payload || typeof event.payload !== 'object') return null
   const payload = event.payload
-  const sessionId = payload.session_id
-  const provider = payload.provider
-  const model = payload.model
-  const version = payload.schema_version
+  const { session_id: sessionId, provider, model, schema_version: version } = payload
+  if (version !== SCHEMA_VERSION || typeof sessionId !== 'string' || !sessionId ||
+      typeof provider !== 'string' || !provider || typeof model !== 'string' || !model ||
+      typeof payload.measured !== 'boolean') return null
 
-  // provider and model are contract fields — a frame without them comes from a
-  // different producer — but the readout never reads them back: a row is a
-  // session's newest result, and the SDK cannot resolve the focused session's
-  // own model to compare against anyway.
-  if (version !== SCHEMA_VERSION || typeof sessionId !== 'string' || !sessionId || typeof provider !== 'string' || !provider || typeof model !== 'string' || !model) return null
-  if (!payload.measured) {
-    // The latest call was not measured: clear that session's readout.
+  const speed = payload.tok_per_sec
+  const count = payload.valid_samples
+  if (!Number.isSafeInteger(count) || count < 0) return null
+  if (count === 0) {
+    if (payload.measured || speed !== null) return null
     return { sessionId, sample: null }
   }
-  const speed = payload.tok_per_sec
-  const sampleCount = payload.valid_samples
-  if (!Number.isInteger(sampleCount) || sampleCount <= 0) return null
   if (typeof speed !== 'number' || !Number.isFinite(speed) || speed <= 0) return null
-
+  // An unmeasured call does not erase the cumulative speed of earlier calls.
   return { sessionId, sample: { sessionId, tokPerSecond: speed } }
 }
 // PARSE-END

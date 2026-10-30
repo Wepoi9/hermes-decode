@@ -1,3 +1,9 @@
+# 追記：セッション累積デコード仕様（検証ブランチ）
+
+旧仕様（直近10回・モデル／接続先ごとの窓・未計測で表示を消す）は以下の過去の検証記録に残しています。現在の実装仕様は README を参照してください。累積仕様（`schema_version` 3）の CI・実機検証は末尾の 2026-10-30 節にあります。
+
+---
+
 # 検証記録（日付入りの実機・実測の記録）
 
 現在の自動テストと CI が何を実行するかは `README.md` § 検証 が正です。このファイルは、その契約が実機と実接続でどう確認されたかの日付入りの記録です（環境依存の絶対値は載せません）。
@@ -165,3 +171,46 @@ Desktop までの伝達を、既存の環境へ触れない分離インスタン
 - 更新後の head ツリーを fork clone 専用の test environment（同じ `uv.lock`、Python 3.14.7）で実行し、計測テスト `26 passed`、関連スイート 12 ファイル `209 passed, 4 skipped`（失敗 0）を確認しました。実行方法は前節と同じ（pytest 直接実行）。
 - PR 状態（更新直後の読み取り）: `OPEN`・非 Draft・`mergeable: MERGEABLE`・レビュー 0 件・コメント 0 件・1 コミット。上流のワークフローは push 後に `action_required` になり、メンテナの承認を待つ状態です（CI・Docker Build・Nix flake check・Label rerun・Plugin Catalog CI、`Docs Search Monitor` の 1 本だけが success）。つまり上流 CI は緑ではなく、承認ゲートで止まっています。原因が最初のコントリビューション承認なのか他の条件なのかは、GitHub の読み取りでは確定できません。
 - PR 本文は現行の事実へ更新しました。古い基準の記述と v0.22.2 / v0.22.4 ツリーへの適用に関する記述は削除し、Windows での直接実行と GitHub Actions の検証を区別し、当リポジトリの `patches/decode-hook.patch` が push 済みのコミットと一致し公開 CI が新基準で 3 ジョブ成功している旨を明記しています（上流のメンテナ承認を待つ状態であることも併記しました）。
+
+## 累積仕様の CI・実機検証（2026-10-30、ブランチ `feat/session-cumulative-decode` head `3b56d70`）
+
+### CI とテスト
+
+- GitHub Actions は push ラン `41020316261` と pull_request ラン `41020322023` のどちらとも 3 ジョブ成功（Plugin aggregation tests・Desktop half syntax and matcher・Core patch applies to its base commit and its tests run）。PR #1 は Draft のまま、base は `main`、`mergeable: MERGEABLE`。
+- ローカル: `python -m pytest tests -q` で 27 passed、`node tests/desktop-match.test.mjs` が `desktop cumulative matcher tests passed`。同じテストを base の `__init__.py` へ当てると 24 failed / 2 passed（新テストが新しい挙動を本当に検出している）。
+- 変異テスト（作業コピーで意図的な欠陥を 4 本仕込んで回帰検出を確認）: 移し元のセッション状態を削除しない → 3 failed、移行先の既存計測を上書きする → 3 failed、`post_compaction` が移さない → 1 failed、親の provider/model 復元を省く → 3 failed。`old_session_id == session_id` の防御だけを外す変異は検出されません。in-place では本体が `old_session_id = ""` を渡す（`agent/compaction_events.py:315` 付近）ため空文字チェックで止まり、仮に空が通っても `carry_over` は移し元に状態が無いので nothing を返します。つまり「in-place は集計を変えない」は 1 本のテストではなく 2 段のガードで成立しています。
+
+### 実機 Desktop E2E（隔離環境）
+
+ライブの Hermes home・gateway・Desktop は使っていません。パッチ適用済みの Hermes チェックアウト（base `145f26b5a5…` に計測コミット `41ea0303ff…` を当てたもの）の `apps/desktop` を `npm run build` し、Playwright の `_electron` で、専用 `HERMES_HOME`・専用の `--user-data-dir`（`HERMES_DESKTOP_USER_DATA_DIR`）・`HERMES_DESKTOP_ISOLATED_BACKEND=1`・`onboarding.run: false`・`approvals.mode: 'off'` の sandbox を起動しました。接続先はループバック専用の mock SSE endpoint（`custom` provider を `config.yaml` 側へ書く。`OPENAI_BASE_URL` 環境変数は参照されない）で、最終チャンクに `usage`（`output_tokens`）を常に載せ、トークン数と chunk 間隔を呼び出しごとにスクリプト化しました。プラグインは PR ブランチの両半份を sandbox へコピーし（`plugins/hermes-decode/` と `desktop-plugins/hermes-decode/plugin.js`）、Desktop 側のコピーだけ検証用に `defaultEnabled: true` にしています。表示項目はアプリ側の設定に保存される可視性スイッチ（`statusbar-controls.tsx:97` の `hiddenIds` 判定）で、既定は表示側です。
+
+実 DOM（ステータスバーの項目テキスト。`—` は未計測）で確認できたこと:
+
+- 最初の計測呼び出しで数値が出ます。スクリプト 100 tokens / 約 0.22 秒 → 表示 `463 t/s`。
+- 2 呼び目で累積になることを、平均との差で判別しました。100 tokens/約 0.22 秒 + 10 tokens/約 1.09 秒 → 表示 `84 t/s`（Σ 110 / Σ 約 1.31 秒）。呼び出しごとの速度の平均なら約 232 になるので、`Σ tokens / Σ seconds` であることが実機で判別できます。
+- 12 呼び後は表示 `44 t/s`（Σ 210 tokens / Σ 約 4.8 秒）。平均の平均なら約 68 です。
+- usage を載せない呼び出しの後も表示は `44 t/s` のまま（保持）。最初から未計測なら `—`。
+- セッションは分離されています。新しいセッションを作った瞬間は数値なし、そのセッションで計測すると自分の値 `33 t/s`（前のセッションの `44 t/s` とは別）。gateway ログの `session=` も 2 値に分かれています（`local-f040b4ca…` と `local-104d4fa8…`）。
+- 本体の補助呼び出しは集計に混ざりません。ターン完了後のメモリ抽出呼び出し（`aux`）が挟まった後も表示は `44 t/s` のままでした（`agent/AGENTS.md` の「main-loop の pre/post_api_request は aux 呼び出しで発火しない」どおり）。
+- ゲートウェイ側では `<sandbox>/logs/agent.log` に `capability_check plugin=hermes-decode` とプラグイン discovery 完了が残っています。フック発火そのものは、Desktop 側表示がターン完了ごとに更新されたこと（上記の実測値）が端到端の証拠です。renderer のコンソールにプラグイン load 失敗は出ていません。
+
+### CDP による再確認（同日、別の接続経路）
+
+同じ隔離 sandbox で Electron に `--remote-debugging-port=19299` を与え、別プロセスから CDP を読みました（`/json/version` は `Chrome/152.0.7977.167`・`Protocol-Version 1.3`、User-Agent に sandbox アプリ名が入る）。`connectOverCDP` で開いたページからステータスバー項目テキストを拾うと、アプリ側（Playwright の Electron チャンネル）と同じ値になりました: 1 呼び目 `409 t/s`（100 tokens / 約 0.25 秒）、2 呼び目 `83 t/s`（Σ 110 / Σ 約 1.33 秒。速度の平均なら約 224）、3 呼び目 `73 t/s`（Σ 120 / Σ 約 1.64 秒。平均なら約 161）、usage を載せない 4 呼び目後も `73 t/s` のまま。両経路の読み取りが一致したので、表示は renderer の実 DOM の値です（ホバー泡の文言は属性に入らないため、泡の目視確認は過去の節どおり実マウスホバー側の記録に依存します）。
+
+
+### モデル切替の実機操作（確認できなかった）
+
+同一セッション内でモデルを切り替えて累積が連続することを実機で確認しようとし、3 経路を試みて操作を固定できませんでした: (1) ステータスバー/モデルピッカーのテキスト Mock Model をクリックすると別要素に当たり画面が切り替わって composer が data-empty になった、(2) model-pill.tsx:182 の ria-label（モデルピッカーを開く）を getByRole で探すと該当ボタンが見つからない（この sandbox では pill が描画されていない）、(3) composer へ /model（desktop-slash-commands.ts:258 の picker('model')）を入力して Enter すると画面が新しいセッション画面へ移り、mock-model-b の候補は 1 件見つかったものの click が不安定で composer が戻らなかった。よってこの項目は 	ests/test_decode.py:62 の 	est_model_and_endpoint_changes_keep_session_cumulative（モデル・provider・接続先が変わってもセッションの累積が連続する）での確認どおりとし、実機では未確認として残します。集計がセッションだけを key にしていること（sessions_never_share_totals、実機での 2 セッション分離）と、1 呼びごとに速度の違う呼び出しを同一セッションで合算していること（上記の 409 t/s → 83 t/s → 73 t/s）は実機で確認済みです。
+
+### compaction をまたいだ累積
+
+- Desktop の `/compress` は `session.compress` RPC（`src/lib/desktop-slash-commands.ts:273-281`）として実行され、実際に圧縮がコミットされました。直前のリクエスト history が 290KB / 16 messages → 圧縮後 142KB / 8 messages。このとき gateway ログの `session=` は同じ値のまま（in-place）で、表示は `67 t/s` を維持しました。in-place では本体が `old_session_id = ""` を渡すので当プラグインは何もしません（no-op）。
+- 自動 preflight compression も別プロブで発火させました（`model.context_length: 512001` と `compression.threshold: 0.13` で閾値を下げる。既定では 512K 未満の窓は 75% 下限と 64K の floor が効くため、通常の 200K 窓では実用的な量で発火しません）。ログ: `Preflight compression: ~72,774 tokens >= 66,560 threshold (model mock-model, ctx 512,001)`、`context compression started: session=local-1c2aa077… messages=15`、`context compression done: session=local-1c2aa077… messages=15->7`。この経路も **同じ session id** でコミットされました（in-place）。
+- 圧縮をまたいだ連続性は、意図的に遅いターンで判別しました。圧縮前の 7 ターン（120 tokens / 約 1.78 秒ずつ）で表示 `68 t/s`、圧縮後の通常のターン（120 tokens / 約 1.73 秒）でも `68 t/s`、その後に 40 tokens / 約 1.87 秒 のターンを足すと表示 `63 t/s`（Σ 1000 / Σ 約 16.0 秒）。集計がリセットされていれば `21 t/s`、移し替えを二重加算していれば `68 t/s` から大きくずれるので、両方の誤りを実機で否定できています。
+- session id が切り替わる経路（`mint_session_id()` + `publish_compression_child` による child 継続、child .resume 時の adoption）は、この Desktop/gateway チャット経路では発生しませんでした（上記 2 例とも in-place、`post_compaction` は `old_session_id = ""` で発火）。移し替え自体は `tests/test_decode.py` のコンパクションテスト（回転で累積が新 id へ移る・新 id で先に計測済みなら合算・同じイベントを繰り返しても二重加算しない・溢れ時に両セッションを保持・新 id へ累積値のイベントを `measured: false` で発行）で確認しています。実機で child 継続まで確認した、とは書けません。
+- `schema_version: 2` の frame を拒否することは実機に清浄な注入点が無いため、`tests/desktop-match.test.mjs:65` 側の確認です。
+
+### 撤去
+
+プロブが起動した Electron と隔離 gateway を止めて、sandbox home・専用 user-data-dir・リポジトリへ置いたプロブスクリプトの写しを削除しました。アプリ側は `app.close()`、隔離 gateway は `Get-CimInstance Win32_Process` で `ExecutablePath` がプロブ用チェックアウトの `.venv\Scripts\python.exe` と一致するものだけを選んで `Stop-Process` しました（プロブごとに起動した隔離 gateway だけを、`app.close()` と合わせて停止しました。コマンドライン文字列で条件を組むと、その文字列を含む自分のシェルまで拾ってしまうので、実行パスで判定しています）。使ったポート（18765/18931/18941/18951/18961/18971/18981/18991/19001/19011/19222/19299/19321）は listener 0 件、sandbox ディレクトリは 0 件、`tmp/hermes-fork` の tracked 変更は無く、ライブの Hermes home（`SCHEMA_VERSION = 2` のまま・gateway 稼働継続）と `main`（`12a6f7a`）は無変更です。

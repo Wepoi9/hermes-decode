@@ -1,18 +1,11 @@
-"""Hermes Decode plugin: bounded, in-memory decode throughput aggregation."""
+"""Hermes Decode plugin: session-cumulative decode throughput in memory."""
 
-from collections import OrderedDict, deque
 import math
 from numbers import Real
 import threading
 
 PLUGIN_ID = "hermes-decode"
-# These caps and the payload keys are the contract with the Desktop half, which
-# repeats them (desktop/plugin.js) because the two halves cannot import each
-# other: tests/desktop-match.test.mjs asserts the numbers still match this file.
-WINDOW_SIZE = 10          # completed calls kept per (session, endpoint) window
-MAX_DECODE_WINDOWS = 8    # windows retained at once (LRU); the Desktop half caps
-                          # the same number, but counts sessions, not windows
-SCHEMA_VERSION = 2        # payload contract version the Desktop half checks
+SCHEMA_VERSION = 3
 
 
 def _positive_finite(value):
@@ -32,121 +25,95 @@ def _output_tokens(usage):
     return _positive_finite(value)
 
 
-def _endpoint_key(base_url):
-    """Normalize the endpoint the hook carries into this process's window key.
-
-    The key only indexes the windows inside this process: the Desktop half
-    never receives the URL, nor any digest of it, so nothing has to be hidden
-    here. Root URLs are normalized (trim, drop the trailing slash, casefold)
-    so the same endpoint always lands in the same window; a missing or
-    malformed URL carries no key and stays None.
-    """
-    if not isinstance(base_url, str):
-        return None
-    normalized = base_url.strip().rstrip("/")
-    if not normalized:
-        return None
-    return normalized.casefold()
-
-
 class DecodeAggregator:
-    """Maintain last-ten windows per session and endpoint with a bounded LRU.
+    """Accumulate measured decode tokens and seconds for each session.
 
-    The window is keyed by (session, connection endpoint): another session
-    never borrows a measurement, and the same session never mixes two endpoints
-    into one aggregate. A model change clears that session's decode history —
-    decode speed leans on model performance, so yesterday's model's numbers
-    must not answer today's model's readout. The endpoint key stays inside
-    this process; the Desktop half only ever sees the readout.
+    Model and connection changes remain in the same session total, matching
+    session-wide usage counters. A compaction that rotates the session id moves
+    the total onto the session that now holds the transcript. State lasts until
+    the plugin/gateway restarts; it is not reconstructed from the session log.
     """
 
     def __init__(self):
-        self._windows = OrderedDict()
-        # Last seen model per session, kept to the same small LRU as the
-        # windows: a session switching models resets its decode history.
-        self._models = OrderedDict()
-        # One small lock over the window bookkeeping: concurrent model calls
-        # land on the same aggregator from several API threads, and the plugin
-        # reloads without a server restart. The design stays in-memory.
+        self._totals = {}
+        # Last identity seen for a session so a compaction carry-over can still
+        # name provider/model, which the event contract requires. Not a key.
+        self._identity = {}
         self._lock = threading.Lock()
 
-    def _remember_model(self, session, model):
-        # Callers must hold the lock (record is the only caller).
-        # Returns True when this call starts a NEW model for the session.
-        previous = self._models.get(session)
-        self._models.pop(session, None)
-        self._models[session] = model
-        while len(self._models) > MAX_DECODE_WINDOWS:
-            evicted, _ = self._models.popitem(last=False)
-            self._drop_session_windows(evicted)
-        return previous is not None and previous != model
+    @staticmethod
+    def _speed(total_tokens, total_seconds, count):
+        """Round the cumulative ratio, or return None when nothing was measured."""
+        if not count or total_seconds <= 0:
+            return None
+        rate = total_tokens / total_seconds
+        if not math.isfinite(rate) or rate <= 0:
+            return None
+        return int(math.floor(rate + 0.5))
 
-    def _drop_session_windows(self, session):
-        # Callers must hold the lock.
-        for key in [key for key in self._windows if key[0] == session]:
-            del self._windows[key]
+    def record(self, session, usage, decode_seconds, provider=None, model=None):
+        """Include a completed, measured API call in the session total."""
+        tokens = _output_tokens(usage)
+        seconds = _positive_finite(decode_seconds)
+        measured = tokens is not None and seconds is not None
+        with self._lock:
+            if isinstance(provider, str) and provider and isinstance(model, str) and model:
+                self._identity[session] = (provider, model)
+            total_tokens, total_seconds, count = self._totals.get(session, (0.0, 0.0, 0))
+            if measured:
+                next_tokens = total_tokens + tokens
+                next_seconds = total_seconds + seconds
+                if math.isfinite(next_tokens) and math.isfinite(next_seconds):
+                    total_tokens, total_seconds, count = next_tokens, next_seconds, count + 1
+                else:
+                    measured = False
+            self._totals[session] = (total_tokens, total_seconds, count)
 
-    def _touch_window(self, session, endpoint):
-        # Callers must hold the lock (record is the only caller).
-        key = (session, endpoint)
-        window = self._windows.pop(key, None)
-        if window is None:
-            window = deque(maxlen=WINDOW_SIZE)
-        self._windows[key] = window
-        while len(self._windows) > MAX_DECODE_WINDOWS:
-            self._windows.popitem(last=False)
-        return window
+            return {
+                "tok_per_sec": self._speed(total_tokens, total_seconds, count),
+                "valid_samples": count,
+                "measured": measured,
+            }
 
-    def record(self, session, model, endpoint, usage, decode_seconds):
-        """Append one completed API call; return this session's current readout.
+    def carry_over(self, old_session, new_session):
+        """Move a session's cumulative total onto the session holding the transcript.
 
-        The aggregate covers the window's measured calls, but the readout
-        belongs to the LATEST call: an unmeasured call reports no speed, and
-        the history it leaves behind answers the next measured call.
+        ``post_compaction`` reports the previous id only when the transcript
+        rotated, so in-place compaction never reaches here with a distinct pair.
+        The old entry is dropped on the way out: a repeat report carries nothing
+        and cannot double-count. A child that already measured calls keeps both
+        segments, because they belong to one conversation's cumulative total.
         """
         with self._lock:
-            if self._remember_model(session, model):
-                # The session switched models: its decode history resets here,
-                # so the aggregate below only ever answers the current model.
-                self._drop_session_windows(session)
-            window = self._touch_window(session, endpoint)
-            tokens = _output_tokens(usage)
-            seconds = _positive_finite(decode_seconds)
-            measured = tokens is not None and seconds is not None
-            window.append((tokens, seconds) if measured else None)
+            moved = self._totals.pop(old_session, None)
+            if moved is None:
+                return None
+            tokens, seconds, count = moved
+            current_tokens, current_seconds, current_count = self._totals.get(
+                new_session, (0.0, 0.0, 0)
+            )
+            total_tokens = tokens + current_tokens
+            total_seconds = seconds + current_seconds
+            total_count = count + current_count
+            if not (math.isfinite(total_tokens) and math.isfinite(total_seconds)):
+                self._totals[old_session] = moved
+                return None
+            self._totals[new_session] = (total_tokens, total_seconds, total_count)
+            identity = self._identity.get(new_session) or self._identity.get(old_session)
+            self._identity.pop(old_session, None)
+            if identity is None or not total_count:
+                return None
+            return {
+                "tok_per_sec": self._speed(total_tokens, total_seconds, total_count),
+                "valid_samples": total_count,
+                "provider": identity[0],
+                "model": identity[1],
+            }
 
-            token_sum = 0.0
-            seconds_sum = 0.0
-            sample_count = 0
-            for sample in window:
-                if sample is None:
-                    continue
-                sample_tokens, sample_seconds = sample
-                token_sum += sample_tokens
-                seconds_sum += sample_seconds
-                sample_count += 1
-
-            speed = None
-            if sample_count and seconds_sum > 0:
-                rate = token_sum / seconds_sum
-                if math.isfinite(rate) and rate > 0:
-                    speed = int(math.floor(rate + 0.5))
-            if not measured:
-                # The latest call measured nothing: no speed belongs to this
-                # readout, however many earlier calls the window still holds.
-                speed = None
-            return {"tok_per_sec": speed, "valid_samples": sample_count, "measured": measured}
-
-    def history_for(self, session, endpoint):
-        """Expose the bounded window for tests and diagnostic use."""
+    def totals_for(self, session):
+        """Return cumulative tokens, seconds and count for a session (tests)."""
         with self._lock:
-            window = self._windows.get((session, endpoint))
-            return () if window is None else tuple(window)
-
-    @property
-    def retained_window_count(self):
-        with self._lock:
-            return len(self._windows)
+            return self._totals.get(session, (0.0, 0.0, 0))
 
 
 _AGGREGATOR = DecodeAggregator()
@@ -164,16 +131,11 @@ def post_api_request(**kwargs):
     session_id = kwargs.get("session_id")
     provider = kwargs.get("provider")
     model = kwargs.get("model")
-    # Without this identifying tuple, we cannot safely attribute a sample or emit it.
-    # The endpoint only keys this process's windows: it never reaches the
-    # Desktop half, so the payload carries no URL, no digest of it and no
-    # process-generation id.
     if not all(isinstance(value, str) and value for value in (session_id, provider, model)):
         return
-    endpoint = _endpoint_key(kwargs.get("base_url"))
 
     result = _AGGREGATOR.record(
-        session_id, model, endpoint, kwargs.get("usage"), kwargs.get("decode_seconds")
+        session_id, kwargs.get("usage"), kwargs.get("decode_seconds"), provider, model
     )
     payload = {
         "schema_version": SCHEMA_VERSION,
@@ -187,6 +149,35 @@ def post_api_request(**kwargs):
     _broadcast("sample", payload)
 
 
+def post_compaction(**kwargs):
+    """Carry the cumulative total onto the session the transcript rotated to.
+
+    The event is not a measured call, so it reports ``measured: False`` while
+    still publishing the cumulative speed; the Desktop half keeps showing that
+    value instead of blanking the readout after the rotation.
+    """
+    session_id = kwargs.get("session_id")
+    old_session_id = kwargs.get("old_session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return
+    if not isinstance(old_session_id, str) or not old_session_id or old_session_id == session_id:
+        return
+
+    carried = _AGGREGATOR.carry_over(old_session_id, session_id)
+    if carried is None:
+        return
+    _broadcast("sample", {
+        "schema_version": SCHEMA_VERSION,
+        "session_id": session_id,
+        "provider": carried["provider"],
+        "model": carried["model"],
+        "tok_per_sec": carried["tok_per_sec"],
+        "measured": False,
+        "valid_samples": carried["valid_samples"],
+    })
+
+
 def register(ctx):
-    """Register only the post_api_request observer hook."""
+    """Register the observer hooks: completed calls and committed compactions."""
     ctx.register_hook("post_api_request", post_api_request)
+    ctx.register_hook("post_compaction", post_compaction)
