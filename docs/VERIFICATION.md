@@ -199,6 +199,10 @@ Desktop までの伝達を、既存の環境へ触れない分離インスタン
 同じ隔離 sandbox で Electron に `--remote-debugging-port=19299` を与え、別プロセスから CDP を読みました（`/json/version` は `Chrome/152.0.7977.167`・`Protocol-Version 1.3`、User-Agent に sandbox アプリ名が入る）。`connectOverCDP` で開いたページからステータスバー項目テキストを拾うと、アプリ側（Playwright の Electron チャンネル）と同じ値になりました: 1 呼び目 `409 t/s`（100 tokens / 約 0.25 秒）、2 呼び目 `83 t/s`（Σ 110 / Σ 約 1.33 秒。速度の平均なら約 224）、3 呼び目 `73 t/s`（Σ 120 / Σ 約 1.64 秒。平均なら約 161）、usage を載せない 4 呼び目後も `73 t/s` のまま。両経路の読み取りが一致したので、表示は renderer の実 DOM の値です（ホバー泡の文言は属性に入らないため、泡の目視確認は過去の節どおり実マウスホバー側の記録に依存します）。
 
 
+### モデル切替の実機操作（確認できなかった）
+
+同一セッション内でモデルを切り替えて累積が連続することを実機で確認しようとし、3 経路を試みて操作を固定できませんでした: (1) ステータスバー/モデルピッカーのテキスト Mock Model をクリックすると別要素に当たり画面が切り替わって composer が data-empty になった、(2) model-pill.tsx:182 の ria-label（モデルピッカーを開く）を getByRole で探すと該当ボタンが見つからない（この sandbox では pill が描画されていない）、(3) composer へ /model（desktop-slash-commands.ts:258 の picker('model')）を入力して Enter すると画面が新しいセッション画面へ移り、mock-model-b の候補は 1 件見つかったものの click が不安定で composer が戻らなかった。よってこの項目は 	ests/test_decode.py:62 の 	est_model_and_endpoint_changes_keep_session_cumulative（モデル・provider・接続先が変わってもセッションの累積が連続する）での確認どおりとし、実機では未確認として残します。集計がセッションだけを key にしていること（sessions_never_share_totals、実機での 2 セッション分離）と、1 呼びごとに速度の違う呼び出しを同一セッションで合算していること（上記の 409 t/s → 83 t/s → 73 t/s）は実機で確認済みです。
+
 ### compaction をまたいだ累積
 
 - Desktop の `/compress` は `session.compress` RPC（`src/lib/desktop-slash-commands.ts:273-281`）として実行され、実際に圧縮がコミットされました。直前のリクエスト history が 290KB / 16 messages → 圧縮後 142KB / 8 messages。このとき gateway ログの `session=` は同じ値のまま（in-place）で、表示は `67 t/s` を維持しました。in-place では本体が `old_session_id = ""` を渡すので当プラグインは何もしません（no-op）。
@@ -209,4 +213,4 @@ Desktop までの伝達を、既存の環境へ触れない分離インスタン
 
 ### 撤去
 
-プロブが起動した Electron と隔離 gateway（`tmp/hermes-fork/.venv` 由来のプロセス。アプリ側は `app.close()`、gateway は `Get-CimInstance Win32_Process` でコマンドラインが `tmp\hermes-fork\.venv` を指すものだけを確認して `Stop-Process`）を止めて、sandbox home・専用 user-data-dir・リポジトリへ置いたプロブスクリプトの写しを削除しました。使ったポート（18765/18931/18941/18951/18961/18971/18981/19222/19299/19321）は listener 0 件、`tmp/hermes-fork` の tracked 変更は無く、ライブの Hermes home（`SCHEMA_VERSION = 2` のまま・gateway 稼働継続）と `main`（`12a6f7a`）は無変更です。
+プロブが起動した Electron と隔離 gateway を止めて、sandbox home・専用 user-data-dir・リポジトリへ置いたプロブスクリプトの写しを削除しました。アプリ側は `app.close()`、隔離 gateway は `Get-CimInstance Win32_Process` で `ExecutablePath` がプロブ用チェックアウトの `.venv\Scripts\python.exe` と一致するものだけを選んで `Stop-Process` しました（プロブごとに起動した隔離 gateway だけを、`app.close()` と合わせて停止しました。コマンドライン文字列で条件を組むと、その文字列を含む自分のシェルまで拾ってしまうので、実行パスで判定しています）。使ったポート（18765/18931/18941/18951/18961/18971/18981/18991/19001/19011/19222/19299/19321）は listener 0 件、sandbox ディレクトリは 0 件、`tmp/hermes-fork` の tracked 変更は無く、ライブの Hermes home（`SCHEMA_VERSION = 2` のまま・gateway 稼働継続）と `main`（`12a6f7a`）は無変更です。
