@@ -190,11 +190,129 @@ def test_plugin_reload_resets_in_memory_state():
     assert previous.totals_for("s") == (100, 1, 1)
 
 
-def test_register_only_uses_post_api_request():
+def test_register_observer_hooks():
     class Context:
-        registrations = []
+        def __init__(self):
+            self.registrations = []
         def register_hook(self, name, callback):
             self.registrations.append((name, callback))
     ctx = Context()
     plugin.register(ctx)
-    assert ctx.registrations == [("post_api_request", plugin.post_api_request)]
+    assert ctx.registrations == [
+        ("post_api_request", plugin.post_api_request),
+        ("post_compaction", plugin.post_compaction),
+    ]
+
+
+def test_plugin_yaml_declares_every_registered_hook():
+    manifest = (Path(__file__).resolve().parents[1] / "plugin.yaml").read_text(encoding="utf-8")
+    declared = [
+        line.strip()[2:] for line in manifest.splitlines()
+        if line.strip().startswith("- ")
+    ]
+
+    class Context:
+        def __init__(self):
+            self.names = []
+        def register_hook(self, name, callback):
+            self.names.append(name)
+
+    ctx = Context()
+    plugin.register(ctx)
+    assert sorted(ctx.names) == sorted(declared)
+
+
+def test_in_place_compaction_changes_no_totals():
+    state = plugin.DecodeAggregator()
+    state.record("s", {"output_tokens": 300}, 3)
+    assert state.carry_over("s", "s") is None
+    assert state.totals_for("s") == (300, 3, 1)
+
+
+def test_rotating_compaction_moves_cumulative_to_new_session():
+    state = plugin.DecodeAggregator()
+    state.record("parent", {"output_tokens": 300}, 3, "p", "m")
+    carried = state.carry_over("parent", "child")
+    assert carried == {"tok_per_sec": 100, "valid_samples": 1, "provider": "p", "model": "m"}
+    assert state.totals_for("child") == (300, 3, 1)
+    assert state.totals_for("parent") == (0.0, 0.0, 0)
+
+
+def test_rotation_merges_with_calls_already_made_in_the_new_session():
+    state = plugin.DecodeAggregator()
+    state.record("parent", {"output_tokens": 300}, 3, "p", "m")
+    state.record("child", {"output_tokens": 100}, 1, "p", "m")
+    assert state.carry_over("parent", "child")["valid_samples"] == 2
+    assert state.totals_for("child") == (400, 4, 2)
+    assert state.totals_for("parent") == (0.0, 0.0, 0)
+
+
+def test_repeat_rotation_cannot_double_count():
+    state = plugin.DecodeAggregator()
+    state.record("parent", {"output_tokens": 300}, 3, "p", "m")
+    assert state.carry_over("parent", "child") is not None
+    assert state.carry_over("parent", "child") is None
+    assert state.totals_for("child") == (300, 3, 1)
+
+
+def test_rotation_of_an_unmeasured_session_carries_nothing():
+    state = plugin.DecodeAggregator()
+    state.record("parent", None, None, "p", "m")
+    state.record("child", {"output_tokens": 100}, 1, "p", "m")
+    assert state.carry_over("parent", "child")["valid_samples"] == 1
+    assert state.totals_for("child") == (100, 1, 1)
+
+
+def test_rotation_without_prior_state_is_silent():
+    state = plugin.DecodeAggregator()
+    assert state.carry_over("never-seen", "child") is None
+    assert state.totals_for("child") == (0.0, 0.0, 0)
+
+
+def test_overflowing_rotation_leaves_both_sessions_intact():
+    state = plugin.DecodeAggregator()
+    state.record("parent", {"output_tokens": 1e308}, 1, "p", "m")
+    state.record("child", {"output_tokens": 1e308}, 1, "p", "m")
+    assert state.carry_over("parent", "child") is None
+    assert state.totals_for("parent") == (1e308, 1, 1)
+    assert state.totals_for("child") == (1e308, 1, 1)
+
+
+def compaction_hooks(monkeypatch, calls):
+    emitted = []
+    monkeypatch.setattr(plugin, "_broadcast", lambda event, payload: emitted.append((event, payload)))
+    monkeypatch.setattr(plugin, "_AGGREGATOR", plugin.DecodeAggregator())
+    for call in calls:
+        if "old_session_id" in call:
+            plugin.post_compaction(**call)
+        else:
+            plugin.post_api_request(**call)
+    return [payload for event, payload in emitted if event == "sample"]
+
+
+def test_rotation_event_publishes_cumulative_speed_for_the_new_session(monkeypatch):
+    payloads = compaction_hooks(monkeypatch, [
+        {"session_id": "parent", "provider": "p", "model": "m",
+         "usage": {"output_tokens": 300}, "decode_seconds": 3},
+        {"session_id": "child", "old_session_id": "parent"},
+        {"session_id": "child", "provider": "p", "model": "m",
+         "usage": {"output_tokens": 100}, "decode_seconds": 1},
+    ])
+    assert payloads[1] == {"schema_version": 3, "session_id": "child", "provider": "p",
+                           "model": "m", "tok_per_sec": 100, "measured": False,
+                           "valid_samples": 1}
+    assert payloads[2]["valid_samples"] == 2
+    assert payloads[2]["tok_per_sec"] == 100
+
+
+def test_in_place_compaction_hook_is_silent(monkeypatch):
+    payloads = compaction_hooks(monkeypatch, [
+        {"session_id": "s", "provider": "p", "model": "m",
+         "usage": {"output_tokens": 300}, "decode_seconds": 3},
+        {"session_id": "s", "old_session_id": ""},
+        {"session_id": "s", "old_session_id": None},
+        {"session_id": "", "old_session_id": "other"},
+    ])
+    assert len(payloads) == 1
+    assert payloads[0]["session_id"] == "s"
+

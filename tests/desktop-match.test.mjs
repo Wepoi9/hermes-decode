@@ -45,11 +45,20 @@ const measured = { payload: { ...base, tok_per_sec: 100, measured: true, valid_s
 const unmeasuredWithHistory = {
   payload: { ...base, tok_per_sec: 100, measured: false, valid_samples: 2 }
 }
+// A compaction rotation publishes the carried cumulative value the same way:
+// measured is false because the rotation itself was not a call, while the
+// cumulative speed and its sample count stay.
+const compactionCarry = {
+  payload: { ...base, tok_per_sec: 100, measured: false, valid_samples: 1 }
+}
 const unmeasuredWithoutHistory = {
   payload: { ...base, tok_per_sec: null, measured: false, valid_samples: 0 }
 }
 assert.deepEqual(parseSample(measured), { sessionId: 's1', sample: { sessionId: 's1', tokPerSecond: 100 } })
 assert.deepEqual(parseSample(unmeasuredWithHistory), {
+  sessionId: 's1', sample: { sessionId: 's1', tokPerSecond: 100 }
+})
+assert.deepEqual(parseSample(compactionCarry), {
   sessionId: 's1', sample: { sessionId: 's1', tokPerSecond: 100 }
 })
 assert.deepEqual(parseSample(unmeasuredWithoutHistory), { sessionId: 's1', sample: null })
