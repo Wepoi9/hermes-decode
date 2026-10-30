@@ -3,8 +3,12 @@ name: CI
 # Actions are pinned to full commit SHAs (node24-ready majors). Runners are pinned
 # to ubuntu-24.04 because the ubuntu-latest label migrates to Ubuntu 26 in late 2026.
 
+# `push` is limited to `main` so a branch that is open as a pull request runs the
+# checks once (from `pull_request`) instead of twice per commit. Merge-blocking
+# coverage stays on pull requests; `main` keeps post-merge coverage.
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
